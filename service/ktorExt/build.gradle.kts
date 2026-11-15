@@ -71,6 +71,8 @@ kotlin {
                 // on common by default and will correctly pull the iOS artifacts of any
                 // KMP dependencies declared in commonMain.
                 implementation(libs.ktor.client.darwin)
+                // HMAC (Hmac.ios.kt): okio's hmacSha* stand in for javax.crypto.Mac.
+                implementation(libs.okio)
             }
         }
     }
