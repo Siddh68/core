@@ -1,4 +1,8 @@
+@file:OptIn(ExperimentalKotlinGradlePluginApi::class)
+
 import com.android.build.gradle.internal.tasks.CompileArtProfileTask
+import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
+import org.jetbrains.kotlin.gradle.plugin.KotlinPlatformType
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
@@ -14,9 +18,22 @@ kotlin {
         minSdk = 26
     }
 
-    // Android sends, Desktop receives; iOS takes no part. With JVM-based targets only, commonMain can
-    // use javax.crypto directly — no expect/actual for the cipher.
+    // Android sends, Desktop receives; iOS takes no part. The iOS targets exist so the module compiles
+    // for every platform core builds for: the cipher, gzip and LAN discovery are expect/actual, with one
+    // javax.crypto/java.net implementation shared by Android and JVM (jvmSharedMain) and an iOS actual
+    // that reports "unsupported".
     jvm()
+    iosArm64()
+    iosSimulatorArm64()
+
+    applyDefaultHierarchyTemplate {
+        common {
+            group("jvmShared") {
+                withJvm()
+                withCompilations { it.platformType == KotlinPlatformType.androidJvm }
+            }
+        }
+    }
 
     sourceSets {
         commonMain {

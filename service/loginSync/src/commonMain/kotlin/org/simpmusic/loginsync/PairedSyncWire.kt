@@ -2,11 +2,6 @@ package org.simpmusic.loginsync
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
-import java.security.SecureRandom
-import java.util.zip.GZIPInputStream
-import java.util.zip.GZIPOutputStream
 import kotlin.io.encoding.Base64
 
 /*
@@ -52,29 +47,12 @@ object PairedSyncWire {
         phoneId: String,
     ): ByteArray = "simpmusic-library-sync/v1/$kind/${if (reply) "reply" else "request"}/$phoneId".encodeToByteArray()
 
-    private val random = SecureRandom()
+    internal fun nonce(): String = secureRandomBytes(16).toKeyHex()
 
-    internal fun nonce(): String = ByteArray(16).also(random::nextBytes).toKeyHex()
-
-    internal fun gzip(plain: ByteArray): ByteArray =
-        ByteArrayOutputStream().use { out ->
-            GZIPOutputStream(out).use { it.write(plain) }
-            out.toByteArray()
-        }
+    internal fun gzip(plain: ByteArray): ByteArray = gzipBytes(plain)
 
     /** Null past [MAX_PLAIN_BYTES]: a body that inflates without end is refused, not swallowed. */
-    internal fun gunzip(packed: ByteArray): ByteArray? =
-        GZIPInputStream(ByteArrayInputStream(packed)).use { input ->
-            val out = ByteArrayOutputStream()
-            val buffer = ByteArray(64 * 1024)
-            while (true) {
-                val read = input.read(buffer)
-                if (read < 0) break
-                out.write(buffer, 0, read)
-                if (out.size() > MAX_PLAIN_BYTES) return null
-            }
-            out.toByteArray()
-        }
+    internal fun gunzip(packed: ByteArray): ByteArray? = gunzipBytes(packed, MAX_PLAIN_BYTES)
 }
 
 @Serializable

@@ -39,14 +39,8 @@ kotlin {
                 implementation(libs.ktor.client.content.negotiation)
                 implementation(libs.ktor.serialization.kotlinx.protobuf)
                 implementation(libs.ktor.client.logging)
-
-                implementation(libs.kotlin.reflect)
                 implementation(libs.kotlin.test)
-
-                implementation(libs.common)
                 implementation(projects.common)
-
-                implementation(libs.logging)
             }
         }
 
@@ -58,6 +52,11 @@ kotlin {
 
         androidMain {
             dependencies {
+                // JVM-only artifacts, kept on the Android/JVM classpath exactly as before; iOS has no
+                // build of them.
+                implementation(libs.kotlin.reflect)
+                implementation(libs.common)
+                implementation(libs.logging)
                 implementation(libs.kotlin.onetimepassword)
             }
         }
@@ -69,11 +68,18 @@ kotlin {
                 // part of KMP’s default source set hierarchy. Note that this source set depends
                 // on common by default and will correctly pull the iOS artifacts of any
                 // KMP dependencies declared in commonMain.
+                // HMAC-SHA1 for the TOTP (SpotifyTotp.ios.kt), in place of kotlin-onetimepassword.
+                implementation(libs.okio)
             }
         }
 
         jvmMain {
             dependencies {
+                // JVM-only artifacts, kept on the Android/JVM classpath exactly as before; iOS has no
+                // build of them.
+                implementation(libs.kotlin.reflect)
+                implementation(libs.common)
+                implementation(libs.logging)
                 implementation(libs.kotlin.onetimepassword)
             }
         }

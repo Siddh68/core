@@ -34,10 +34,7 @@ internal fun parseAlbumData(data: AlbumPage): AlbumBrowse {
                     },
                 duration =
                     if (songItem.duration != null) {
-                        "%02d:%02d".format(
-                            (songItem.duration ?: 0) / 60,
-                            (songItem.duration ?: 0) % 60,
-                        )
+                        formatMinutesSeconds(songItem.duration ?: 0)
                     } else {
                         ""
                     },

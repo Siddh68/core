@@ -52,7 +52,6 @@ kotlin {
                 implementation(libs.ktor.client.content.negotiation)
                 implementation(libs.ktor.serialization.kotlinx.json)
                 implementation(libs.kotlinx.serialization.json)
-                implementation(libs.kotlin.reflect)
                 implementation(libs.ktor.client.logging)
                 implementation(libs.ktor.serialization.kotlinx.json)
                 implementation(libs.ktor.serialization.kotlinx.xml)
@@ -72,6 +71,9 @@ kotlin {
 
         androidMain {
             dependencies {
+                // JVM-only artifacts, kept on the Android/JVM classpath exactly as before; iOS has no
+                // build of them.
+                implementation(libs.kotlin.reflect)
                 // Add Android-specific dependencies here. Note that this source set depends on
                 // commonMain by default and will correctly pull the Android artifacts of any KMP
                 // dependencies declared in commonMain.
@@ -97,6 +99,9 @@ kotlin {
 
         jvmMain {
             dependencies {
+                // JVM-only artifacts, kept on the Android/JVM classpath exactly as before; iOS has no
+                // build of them.
+                implementation(libs.kotlin.reflect)
                 implementation(libs.pipepipe.extractor)
                 implementation(libs.brave.extractor)
                 implementation(libs.okhttp3.okhttp)

@@ -42,7 +42,6 @@ kotlin {
                 implementation(libs.ktor.serialization.kotlinx.json)
                 implementation(libs.kotlinx.serialization.json)
                 implementation(libs.kotaml)
-                implementation(libs.kotlin.reflect)
             }
         }
 
@@ -54,6 +53,9 @@ kotlin {
 
         androidMain {
             dependencies {
+                // JVM-only artifacts, kept on the Android/JVM classpath exactly as before; iOS has no
+                // build of them.
+                implementation(libs.kotlin.reflect)
                 // Add Android-specific dependencies here. Note that this source set depends on
                 // commonMain by default and will correctly pull the Android artifacts of any KMP
                 // dependencies declared in commonMain.
@@ -87,6 +89,9 @@ kotlin {
 
         jvmMain {
             dependencies {
+                // JVM-only artifacts, kept on the Android/JVM classpath exactly as before; iOS has no
+                // build of them.
+                implementation(libs.kotlin.reflect)
                 // Same two as androidMain — see the note there. The desktop build gets Japanese and
                 // Chinese romanization for free because neither library is Android-specific.
                 implementation(libs.kuromoji.ipadic)

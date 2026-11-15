@@ -12,18 +12,13 @@ import io.ktor.client.statement.bodyAsBytes
 import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.IO
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.Inet4Address
-import java.net.InetAddress
-import java.net.NetworkInterface
-import java.net.SocketTimeoutException
 
 private const val TAG = "PairedSyncClient"
 
@@ -179,44 +174,26 @@ class PairedSyncClient {
     private suspend fun probe(target: PairedTarget): LocatedDesktop? =
         withContext(Dispatchers.IO) {
             try {
-                DatagramSocket().use { socket ->
-                    socket.broadcast = true
-                    socket.soTimeout = 300
-                    val nonce = PairedSyncWire.nonce()
-                    val idBytes = target.phoneId.encodeToByteArray()
-                    val sealed =
-                        LoginSyncCipher.seal(
+                val nonce = PairedSyncWire.nonce()
+                val idBytes = target.phoneId.encodeToByteArray()
+                val sealed =
+                    LoginSyncCipher.seal(
+                        target.key,
+                        PairedSyncWire.aad(PairedSyncWire.PROBE, false, target.phoneId),
+                        PairedSyncWire.json.encodeToString(Knock.serializer(), Knock(nonce)).encodeToByteArray(),
+                    )
+                val payload = PairedSyncWire.PROBE_MAGIC + byteArrayOf(idBytes.size.toByte()) + idBytes + sealed
+                val destinations = listOf(PairedSyncWire.GROUP, "255.255.255.255") + broadcastAddresses()
+                udpProbe(destinations.distinct(), target.port, payload, windowMillis = 1_500) { host, data ->
+                    val magic = PairedSyncWire.REPLY_MAGIC
+                    if (data.size <= magic.size || !data.copyOfRange(0, magic.size).contentEquals(magic)) return@udpProbe null
+                    val plain =
+                        LoginSyncCipher.open(
                             target.key,
-                            PairedSyncWire.aad(PairedSyncWire.PROBE, false, target.phoneId),
-                            PairedSyncWire.json.encodeToString(Knock.serializer(), Knock(nonce)).encodeToByteArray(),
-                        )
-                    val payload = PairedSyncWire.PROBE_MAGIC + byteArrayOf(idBytes.size.toByte()) + idBytes + sealed
-                    val destinations = listOf(PairedSyncWire.GROUP, "255.255.255.255") + broadcastAddresses()
-                    destinations.distinct().forEach { address ->
-                        runCatching { socket.send(DatagramPacket(payload, payload.size, InetAddress.getByName(address), target.port)) }
-                    }
-                    val deadline = System.currentTimeMillis() + 1_500
-                    val buffer = ByteArray(8192)
-                    while (System.currentTimeMillis() < deadline) {
-                        val packet = DatagramPacket(buffer, buffer.size)
-                        try {
-                            socket.receive(packet)
-                        } catch (e: SocketTimeoutException) {
-                            continue
-                        }
-                        val data = packet.data.copyOfRange(packet.offset, packet.offset + packet.length)
-                        val magic = PairedSyncWire.REPLY_MAGIC
-                        if (data.size <= magic.size || !data.copyOfRange(0, magic.size).contentEquals(magic)) continue
-                        val plain =
-                            LoginSyncCipher.open(
-                                target.key,
-                                PairedSyncWire.aad(PairedSyncWire.PROBE, true, target.phoneId),
-                                data.copyOfRange(magic.size, data.size),
-                            ) ?: continue
-                        val host = packet.address?.hostAddress ?: continue
-                        verified(target, plain, nonce, host)?.let { return@use it }
-                    }
-                    null
+                            PairedSyncWire.aad(PairedSyncWire.PROBE, true, target.phoneId),
+                            data.copyOfRange(magic.size, data.size),
+                        ) ?: return@udpProbe null
+                    verified(target, plain, nonce, host)
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
@@ -230,7 +207,7 @@ class PairedSyncClient {
      * a few dozen at a time, and stops at the first that answers as the paired computer.
      */
     private suspend fun sweep(target: PairedTarget): LocatedDesktop? {
-        val own = ownAddresses()
+        val own = lanAddresses()
         val candidates =
             own
                 // Never the carrier's network or a tunnel: only the networks a computer could be on.
@@ -303,27 +280,4 @@ class PairedSyncClient {
     }
 
     private fun hostPart(host: String) = if (':' in host) "[$host]" else host
-
-    private companion object {
-        // Cellular, VPN and tunnel interfaces on Android and desktops: sweeping them would knock on strangers.
-        val NOT_A_LAN = listOf("rmnet", "ccmni", "pdp", "v4-", "tun", "ppp", "dummy", "tailscale", "utun", "wg")
-    }
-
-    private fun interfaces(): List<NetworkInterface> =
-        runCatching { NetworkInterface.getNetworkInterfaces()?.toList().orEmpty() }
-            .getOrDefault(emptyList())
-            .filter { runCatching { it.isUp && !it.isLoopback && !it.isVirtual }.getOrDefault(false) }
-
-    private fun ownAddresses(): List<String> =
-        interfaces()
-            .filterNot { nic -> NOT_A_LAN.any { nic.name.startsWith(it) } }
-            .flatMap { nic -> nic.inetAddresses.toList() }
-            .filterIsInstance<Inet4Address>()
-            .filterNot { it.isLinkLocalAddress }
-            .mapNotNull { it.hostAddress }
-
-    private fun broadcastAddresses(): List<String> =
-        interfaces()
-            .flatMap { nic -> nic.interfaceAddresses.orEmpty() }
-            .mapNotNull { it.broadcast?.hostAddress }
 }

@@ -32,19 +32,19 @@ kotlin {
                 implementation(libs.ktor.client.content.negotiation)
                 implementation(libs.ktor.serialization.kotlinx.protobuf)
                 implementation(libs.ktor.client.logging)
-
-                implementation(libs.kotlin.reflect)
                 implementation(libs.kotlin.test)
-
-                implementation(libs.common)
-
-                implementation(libs.logging)
                 implementation(libs.okio)
             }
         }
 
         androidMain {
-            dependencies {}
+            dependencies {
+                // JVM-only artifacts, kept on the Android/JVM classpath exactly as before; iOS has no
+                // build of them.
+                implementation(libs.kotlin.reflect)
+                implementation(libs.common)
+                implementation(libs.logging)
+            }
         }
 
         iosMain {
@@ -52,7 +52,13 @@ kotlin {
         }
 
         jvmMain {
-            dependencies {}
+            dependencies {
+                // JVM-only artifacts, kept on the Android/JVM classpath exactly as before; iOS has no
+                // build of them.
+                implementation(libs.kotlin.reflect)
+                implementation(libs.common)
+                implementation(libs.logging)
+            }
         }
     }
 }

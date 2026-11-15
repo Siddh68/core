@@ -2,8 +2,10 @@ package com.maxrave.data.db
 
 import DatabaseDao
 import androidx.room.AutoMigration
+import androidx.room.ConstructedBy
 import androidx.room.Database
 import androidx.room.RoomDatabase
+import androidx.room.RoomDatabaseConstructor
 import androidx.room.TypeConverters
 import androidx.room.execSQL
 import androidx.room.useWriterConnection
@@ -108,6 +110,7 @@ import com.maxrave.domain.data.entities.sync.SyncChangeEntity
     ],
 )
 @TypeConverters(Converters::class)
+@ConstructedBy(MusicDatabaseConstructor::class)
 abstract class MusicDatabase : RoomDatabase() {
     abstract fun getDatabaseDao(): DatabaseDao
 
@@ -141,6 +144,15 @@ abstract class MusicDatabase : RoomDatabase() {
         val quoted = path.replace("'", "''")
         useWriterConnection { it.execSQL("VACUUM INTO '$quoted'") }
     }
+}
+
+/**
+ * Room needs this on non-Android targets (iOS has no reflection to find `MusicDatabase_Impl`). The
+ * Room compiler generates the `actual` for every target.
+ */
+@Suppress("KotlinNoActualForExpect")
+expect object MusicDatabaseConstructor : RoomDatabaseConstructor<MusicDatabase> {
+    override fun initialize(): MusicDatabase
 }
 
 expect fun getDatabaseBuilder(converters: Converters): RoomDatabase.Builder<MusicDatabase>
