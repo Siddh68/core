@@ -1,16 +1,63 @@
 package com.maxrave.data.di.loader
 
+import com.maxrave.common.Config.SERVICE_SCOPE
 import com.maxrave.domain.data.model.librarysync.LibrarySyncState
 import com.maxrave.domain.data.model.librarysync.PendingSettings
+import com.maxrave.domain.mediaservice.handler.DownloadHandler
+import com.maxrave.domain.repository.CacheRepository
 import com.maxrave.domain.repository.LibrarySyncRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.koin.core.context.loadKoinModules
+import org.koin.core.qualifier.named
 import org.koin.dsl.module
 
-// The iOS player arrives in Phase 2; until then the no-op handler from createMediaServiceHandler is all
-// there is, and it needs no module of its own.
+// The iOS player arrives in Phase 2. Until then createMediaServiceHandler returns a no-op handler,
+// but shared code still resolves the service scope, the player cache and the download handler,
+// so bind stand-ins that hold nothing and do nothing.
 actual fun loadMediaService() {
+    loadKoinModules(
+        module {
+            single<CoroutineScope>(qualifier = named(SERVICE_SCOPE)) {
+                // One writer at a time, like Desktop's single player thread.
+                CoroutineScope(Dispatchers.Default.limitedParallelism(1) + SupervisorJob())
+            }
+            single<CacheRepository> { EmptyCacheRepository }
+            single<DownloadHandler> { NoOpDownloadHandler }
+        },
+    )
+}
+
+private object EmptyCacheRepository : CacheRepository {
+    override suspend fun getCacheSize(cacheName: String): Long = 0L
+
+    override fun clearCache(cacheName: String) = Unit
+
+    override suspend fun getAllCacheKeys(cacheName: String): List<String> = emptyList()
+
+    override suspend fun getFullyCachedSongIds(): List<String> = emptyList()
+
+    override suspend fun removeCachedSong(videoId: String) = Unit
+}
+
+private object NoOpDownloadHandler : DownloadHandler {
+    override suspend fun downloadTrack(
+        videoId: String,
+        title: String,
+        thumbnail: String,
+    ) = Unit
+
+    override fun removeDownload(videoId: String) = Unit
+
+    override fun removeAllDownloads() = Unit
+
+    override val downloads: StateFlow<Map<String, Pair<DownloadHandler.Download?, DownloadHandler.Download?>>> =
+        MutableStateFlow(emptyMap())
+
+    override val downloadTask: StateFlow<Map<String, Int>> = MutableStateFlow(emptyMap())
 }
 
 // iOS takes no part in login or library sync. Shared screens (Settings) still inject
