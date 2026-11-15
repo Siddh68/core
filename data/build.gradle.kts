@@ -38,26 +38,10 @@ kotlin {
         schemaDirectory("$projectDir/schemas")
     }
 
-    // For iOS targets, this is also where you should
-    // configure native binary output. For more information, see:
-    // https://kotlinlang.org/docs/multiplatform-build-native-binaries.html#build-xcframeworks
-
-    // A step-by-step guide on how to include this library in an XCode
-    // project can be found here:
-    // https://developer.android.com/kotlin/multiplatform/migrate
-    val xcfName = "dataKit"
-
-    listOf(
-        iosArm64(),
-        iosSimulatorArm64(),
-    ).forEach { iosTarget ->
-        iosTarget.binaries.framework {
-            baseName = xcfName
-            isStatic = true
-            // Required when using NativeSQLiteDriver
-            linkerOpts.add("-lsqlite3")
-        }
-    }
+    // Library module: the iOS framework (and its -lsqlite3 linker flag for NativeSQLiteDriver) is
+    // declared by the app module that links everything together.
+    iosArm64()
+    iosSimulatorArm64()
 
     jvm {
     }
