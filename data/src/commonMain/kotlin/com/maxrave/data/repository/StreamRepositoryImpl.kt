@@ -91,12 +91,14 @@ internal class StreamRepositoryImpl(
         muxed: Boolean,
     ): Flow<String?> =
         flow {
-            val itag =
+            val wantedItag =
                 if (isDownloading) {
                     QUALITY.itagOf(dataStoreManager.downloadQuality.first())
                 } else {
                     QUALITY.itagOf(dataStoreManager.quality.first())
                 }
+            // AVPlayer has no Opus/WebM decoder: on iOS every quality maps onto its AAC counterpart.
+            val itag = if (streamsForAvPlayer) aacItagFor(wantedItag) else wantedItag
             val videoItag =
                 if (!muxed) {
                     VIDEO_QUALITY.itags.getOrNull(
@@ -169,10 +171,17 @@ internal class StreamRepositoryImpl(
                             ?: formatList.find { !it.isAudio && it.url.isNullOrEmpty().not() }
                     val audioTwinItag = ITAG.highQualityTwinOf(itag)
                     val audioFormat =
-                        formatList.find { it.itag == itag } ?: if (audioTwinItag != null) {
-                            formatList.find { it.itag == audioTwinItag }
+                        if (streamsForAvPlayer) {
+                            // Never the Opus twin and never "any audio": only AAC in MP4 plays.
+                            formatList.find { it.itag == itag }
+                                ?: formatList.find { it.itag == ITAG_AUDIO_AAC_MEDIUM }
+                                ?: formatList.find { it.isAudio && it.mimeType.startsWith("audio/mp4") }
                         } else {
-                            formatList.find { it.isAudio && it.url.isNullOrEmpty().not() }
+                            formatList.find { it.itag == itag } ?: if (audioTwinItag != null) {
+                                formatList.find { it.itag == audioTwinItag }
+                            } else {
+                                formatList.find { it.isAudio && it.url.isNullOrEmpty().not() }
+                            }
                         }
                     var format =
                         if (isVideo) {
@@ -180,7 +189,11 @@ internal class StreamRepositoryImpl(
                         } else {
                             audioFormat
                         }
-                    if (format == null) {
+                    // No AAC stream in the response: AVPlayer plays the HLS manifest natively, which
+                    // beats handing it whatever format happens to be last (usually WebM).
+                    val hlsManifestUrl = response.streamingData?.hlsManifestUrl
+                    val avPlayerHlsFallback = streamsForAvPlayer && !isVideo && !muxed && format == null && hlsManifestUrl != null
+                    if (format == null && !avPlayerHlsFallback) {
                         format = formatList.lastOrNull { it.url.isNullOrEmpty().not() }
                     }
                     if (muxed) {
@@ -272,7 +285,7 @@ internal class StreamRepositoryImpl(
                                 ),
                             cpn = data.first,
                             expiredTime = now().plusSeconds(response.streamingData?.expiresInSeconds?.toLong() ?: 0L),
-                            audioUrl = if (muxed) response.streamingData?.hlsManifestUrl else format?.url,
+                            audioUrl = if (muxed || avPlayerHlsFallback) hlsManifestUrl else format?.url,
                             videoUrl = if (muxed) response.streamingData?.hlsManifestUrl else videoFormat?.url,
                             bpm = tidalBpm,
                             musicKey = tidalMusicKey,
@@ -281,28 +294,28 @@ internal class StreamRepositoryImpl(
                     )
                     if (data.first != null) {
                         emit(
-                            if (muxed) {
-                                response.streamingData?.hlsManifestUrl
+                            if (muxed || avPlayerHlsFallback) {
+                                hlsManifestUrl
                             } else {
                                 format?.url?.let { url ->
                                     if (youTube.isManifestUrl(url)) {
                                         url.plus("&cpn=${data.first}")
                                     } else {
-                                        url.plus("&cpn=${data.first}&range=0-${format.contentLength ?: 10000000}")
+                                        url.plus("&cpn=${data.first}").withWholeFileRange(format.contentLength)
                                     }
                                 }
                             },
                         )
                     } else {
                         emit(
-                            if (muxed) {
-                                response.streamingData?.hlsManifestUrl
+                            if (muxed || avPlayerHlsFallback) {
+                                hlsManifestUrl
                             } else {
                                 format?.url?.let { url ->
                                     if (youTube.isManifestUrl(url)) {
                                         url
                                     } else {
-                                        url.plus("&range=0-${format.contentLength ?: 10000000}")
+                                        url.withWholeFileRange(format.contentLength)
                                     }
                                 }
                             },
@@ -411,3 +424,20 @@ internal class StreamRepositoryImpl(
         }
     }
 }
+/** 140: AAC at 128 kbps, the stream every account gets. Not a user-facing quality, so not in ITAG. */
+private const val ITAG_AUDIO_AAC_MEDIUM = 140
+
+/** The AAC stream that stands in for [itag] where Opus cannot be decoded. */
+private fun aacItagFor(itag: Int?): Int =
+    when (itag) {
+        ITAG.AUDIO_OPUS_HIGH, ITAG.AUDIO_AAC_HIGH -> ITAG.AUDIO_AAC_HIGH
+        else -> ITAG_AUDIO_AAC_MEDIUM
+    }
+
+/**
+ * ExoPlayer and mpv read the whole file through one `range=` query parameter. AVPlayer must not get
+ * it: it seeks with HTTP Range headers of its own, and a URL that already pins the range answers
+ * every one of them with the full file.
+ */
+private fun String.withWholeFileRange(contentLength: Long?): String =
+    if (streamsForAvPlayer) this else plus("&range=0-${contentLength ?: 10000000}")
