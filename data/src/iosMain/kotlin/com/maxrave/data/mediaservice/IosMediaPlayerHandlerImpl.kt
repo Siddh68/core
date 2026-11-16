@@ -290,6 +290,15 @@ class IosMediaPlayerHandlerImpl(
 
     private var bufferedJob: Job? = null
 
+    /**
+     * Last onIsLoadingChanged value. While AVPlayer stalls, the position stops but its last
+     * extrapolated value and the frozen one differ by a few ms; publishing that change as Progress
+     * makes SharedViewModel clear the loading flag a tick after Loading set it, so the rebuffer
+     * spinner never showed. ExoPlayer avoids this by not reporting isPlaying while buffering.
+     */
+    @Volatile
+    private var playerLoading = false
+
     private var updateNotificationJob: Job? = null
 
     private var toggleLikeJob: Job? = null
@@ -980,7 +989,9 @@ class IosMediaPlayerHandlerImpl(
                 while (true) {
                     val intervalMs = if (AppOnScreen.onScreen.value) tickIntervalMs else OFF_SCREEN_TICK_MS
                     delay(intervalMs.milliseconds)
-                    _simpleMediaState.value = SimpleMediaState.Progress(player.currentPosition)
+                    if (!playerLoading) {
+                        _simpleMediaState.value = SimpleMediaState.Progress(player.currentPosition)
+                    }
                     sinceLastPositionSaveMs += intervalMs
                     if (sinceLastPositionSaveMs >= positionPersistIntervalMs) {
                         sinceLastPositionSaveMs = 0
@@ -2930,7 +2941,7 @@ class IosMediaPlayerHandlerImpl(
      *
      * The old escape hatch also compared `bufferedPercentage * duration` (a 0–100 percent times
      * milliseconds) against `currentPosition` (milliseconds) — off by about a hundredfold, so it
-     * was true almost always. Comparing the two positions directly is what it meant to say.
+     * was true almost always. On iOS the escape hatch is gone altogether (see below).
      */
     override fun onIsLoadingChanged(isLoading: Boolean) {
         Logger.d(
@@ -2938,16 +2949,15 @@ class IosMediaPlayerHandlerImpl(
             "onIsLoadingChanged: $isLoading (buffered=${player.bufferedPosition}ms, " +
                 "position=${player.currentPosition}ms, duration=${player.duration}ms)",
         )
+        playerLoading = isLoading
         if (isLoading) {
             startBufferedUpdate()
-            // Already holding more than the playhead needs: the stall is nominal, so do not put a
-            // spinner over playback that is about to continue.
-            if (player.bufferedPosition > player.currentPosition) {
-                _simpleMediaState.value = SimpleMediaState.Ready(player.duration)
-            } else {
-                _simpleMediaState.value =
-                    SimpleMediaState.Loading(player.bufferedPercentage, player.duration)
-            }
+            // No "already buffered past the playhead, so the stall is nominal" shortcut here, unlike
+            // desktop: AvPlayerAdapter only reports loading while AVPlayer is genuinely not playing
+            // (a load in progress, or timeControlStatus = waitingToPlayAtSpecifiedRate), and AVPlayer
+            // waits with data already past the playhead, so that check hid every rebuffer spinner.
+            _simpleMediaState.value =
+                SimpleMediaState.Loading(player.bufferedPercentage, player.duration)
         } else {
             stopBufferedUpdate()
             _simpleMediaState.value = SimpleMediaState.Ready(player.duration)

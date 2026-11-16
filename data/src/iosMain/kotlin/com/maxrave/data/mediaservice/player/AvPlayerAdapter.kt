@@ -187,6 +187,27 @@ class AvPlayerAdapter(
 
     private var cachedIsLoading = false
 
+    /**
+     * A fresh load has been handed to the engine and the adapter has moved on to READY/PLAYING, but
+     * the engine has not reported that it is ready (paused load) or actually playing yet. AVPlayer
+     * still has to open the URL and buffer, which on a phone takes a noticeable while; ExoPlayer stays
+     * in STATE_BUFFERING with isPlaying = false for exactly this stretch, and the UI's loading
+     * indicator is keyed on that. So until [finishAwaitingEngineStart], READY/PLAYING are announced
+     * as BUFFERING, isLoading stays true and isPlaying(true) is held back.
+     */
+    @Volatile
+    private var awaitingEngineStart = false
+
+    /**
+     * Where the item being loaded will start. While PREPARING, [currentPlayer] is still the OLD
+     * track's handle (it is only replaced once the new URL is resolved), and reads of position,
+     * duration and buffer must not answer with the old track's values: the handler would publish the
+     * previous song's length and clock against the new song (the length also picks which lyrics a
+     * provider returns) and would read the old track's buffer as "no need to show loading".
+     */
+    @Volatile
+    private var preparingStartMs = 0L
+
     // Position update job (polling for crossfade detection)
     private var positionUpdateJob: Job? = null
 
@@ -920,18 +941,22 @@ class AvPlayerAdapter(
         get() {
             val pending = pendingSeekPositionMs
             if (pending >= 0) return pending
+            if (internalState == InternalState.PREPARING) return preparingStartMs
             val handle = displayHandle()
             return if (handle == NO_HANDLE) 0L else engine.positionMs(handle)
         }
 
     override val duration: Long
         get() {
+            // Not known yet for the item being prepared (ExoPlayer: C.TIME_UNSET); see preparingStartMs.
+            if (internalState == InternalState.PREPARING) return 0L
             val handle = displayHandle()
             return if (handle == NO_HANDLE) 0L else engine.durationMs(handle)
         }
 
     override val bufferedPosition: Long
         get() {
+            if (internalState == InternalState.PREPARING) return 0L
             val handle = displayHandle()
             return if (handle == NO_HANDLE) 0L else engine.bufferedMs(handle)
         }
@@ -960,8 +985,8 @@ class AvPlayerAdapter(
             when (internalState) {
                 InternalState.IDLE -> PlayerConstants.STATE_IDLE
                 InternalState.PREPARING -> PlayerConstants.STATE_BUFFERING
-                InternalState.READY -> PlayerConstants.STATE_READY
-                InternalState.PLAYING -> PlayerConstants.STATE_READY
+                InternalState.READY, InternalState.PLAYING ->
+                    if (awaitingEngineStart) PlayerConstants.STATE_BUFFERING else PlayerConstants.STATE_READY
                 InternalState.ENDED -> PlayerConstants.STATE_ENDED
                 InternalState.ERROR -> PlayerConstants.STATE_IDLE
                 InternalState.PAUSED -> PlayerConstants.STATE_READY
@@ -1187,27 +1212,34 @@ class AvPlayerAdapter(
         val listeners = listeners
         when (newState) {
             InternalState.PAUSED -> {
+                endLoadingForStop(listeners)
                 listeners.forEach { it.onPlaybackStateChanged(PlayerConstants.STATE_READY) }
                 listeners.forEach { it.onIsPlayingChanged(false) }
             }
 
             InternalState.IDLE -> {
+                endLoadingForStop(listeners)
                 listeners.forEach { it.onPlaybackStateChanged(PlayerConstants.STATE_IDLE) }
                 listeners.forEach { it.onIsPlayingChanged(false) }
             }
 
             InternalState.PREPARING -> {
                 Logger.d(TAG, "transitionToState PREPARING -> isLoading=true")
+                awaitingEngineStart = false
                 cachedIsLoading = true
                 listeners.forEach { it.onPlaybackStateChanged(PlayerConstants.STATE_BUFFERING) }
                 listeners.forEach { it.onIsLoadingChanged(true) }
             }
 
             InternalState.READY -> {
-                Logger.d(TAG, "transitionToState READY -> isLoading=false")
-                cachedIsLoading = false
-                listeners.forEach { it.onPlaybackStateChanged(PlayerConstants.STATE_READY) }
-                listeners.forEach { it.onIsLoadingChanged(false) }
+                // Still loading while the engine opens a fresh item (see awaitingEngineStart).
+                val awaiting = awaitingEngineStart
+                Logger.d(TAG, "transitionToState READY -> isLoading=$awaiting")
+                cachedIsLoading = awaiting
+                listeners.forEach {
+                    it.onPlaybackStateChanged(if (awaiting) PlayerConstants.STATE_BUFFERING else PlayerConstants.STATE_READY)
+                }
+                if (!awaiting) listeners.forEach { it.onIsLoadingChanged(false) }
                 if (internalPlayWhenReady) {
                     play()
                 } else {
@@ -1216,19 +1248,26 @@ class AvPlayerAdapter(
             }
 
             InternalState.PLAYING -> {
-                Logger.d(TAG, "transitionToState PLAYING -> isLoading=false")
-                cachedIsLoading = false
-                listeners.forEach { it.onPlaybackStateChanged(PlayerConstants.STATE_READY) }
-                listeners.forEach { it.onIsLoadingChanged(false) }
-                listeners.forEach { it.onIsPlayingChanged(true) }
+                val awaiting = awaitingEngineStart
+                Logger.d(TAG, "transitionToState PLAYING -> isLoading=$awaiting")
+                cachedIsLoading = awaiting
+                listeners.forEach {
+                    it.onPlaybackStateChanged(if (awaiting) PlayerConstants.STATE_BUFFERING else PlayerConstants.STATE_READY)
+                }
+                if (!awaiting) {
+                    listeners.forEach { it.onIsLoadingChanged(false) }
+                    listeners.forEach { it.onIsPlayingChanged(true) }
+                }
             }
 
             InternalState.ENDED -> {
+                endLoadingForStop(listeners)
                 listeners.forEach { it.onPlaybackStateChanged(PlayerConstants.STATE_ENDED) }
                 listeners.forEach { it.onIsPlayingChanged(false) }
             }
 
             InternalState.ERROR -> {
+                endLoadingForStop(listeners)
                 listeners.forEach { it.onPlaybackStateChanged(PlayerConstants.STATE_IDLE) }
                 listeners.forEach { it.onIsPlayingChanged(false) }
                 listeners.forEach {
@@ -1241,6 +1280,37 @@ class AvPlayerAdapter(
                     )
                 }
             }
+        }
+    }
+
+    /**
+     * Playback stopped (paused, ended, failed, unloaded) while a load or a stall was being reported:
+     * say loading is over BEFORE the state itself, so the handler stops its buffered-percentage loop
+     * (which would otherwise keep publishing Loading over the paused/ended state) and the state
+     * notification that follows is the one the UI settles on.
+     */
+    private fun endLoadingForStop(listeners: List<MediaPlayerListener>) {
+        awaitingEngineStart = false
+        if (cachedIsLoading) {
+            cachedIsLoading = false
+            listeners.forEach { it.onIsLoadingChanged(false) }
+        }
+    }
+
+    /**
+     * The engine has the new item ready (paused load) or is actually playing it: announce what
+     * READY/PLAYING held back while [awaitingEngineStart].
+     */
+    private fun finishAwaitingEngineStart() {
+        if (!awaitingEngineStart) return
+        awaitingEngineStart = false
+        cachedIsLoading = false
+        Logger.d(TAG, "Engine started the item -> isLoading=false (state: $internalState)")
+        val listeners = listeners
+        listeners.forEach { it.onPlaybackStateChanged(PlayerConstants.STATE_READY) }
+        listeners.forEach { it.onIsLoadingChanged(false) }
+        if (internalState == InternalState.PLAYING) {
+            listeners.forEach { it.onIsPlayingChanged(true) }
         }
     }
 
@@ -1262,6 +1332,16 @@ class AvPlayerAdapter(
         currentLoadJob =
             coroutineScope.launch {
                 try {
+                    // The old track stops being "the one playing" now, as ExoPlayer's isPlaying turns
+                    // false the moment it moves to an item it still has to buffer. Announced before
+                    // PREPARING so the handler's pause bookkeeping still reads the old track's
+                    // position; it also stops the handler's progress ticker, which would otherwise
+                    // keep publishing the old track's clock (and clear the loading flag) over the
+                    // new song while its URL is resolved.
+                    if (internalState == InternalState.PLAYING) {
+                        listeners.forEach { it.onIsPlayingChanged(false) }
+                    }
+                    preparingStartMs = startPositionMs.coerceAtLeast(0L)
                     transitionToState(InternalState.PREPARING)
 
                     // Notify media item transition (fire-and-forget to avoid
@@ -1339,9 +1419,11 @@ class AvPlayerAdapter(
                         }
                     }
 
-                    // Always transition to READY first so UI receives
-                    // isLoading=false via STATE_READY. The READY handler
-                    // will auto-call play() when internalPlayWhenReady is true.
+                    // Always transition to READY first; the READY handler will auto-call play() when
+                    // internalPlayWhenReady is true. A precached handle is already open, so READY is
+                    // real. A fresh load is not: the engine has only been handed the URL, so loading
+                    // stays reported until it says it is ready/playing (awaitingEngineStart).
+                    awaitingEngineStart = cachedPrecache == null
                     transitionToState(InternalState.READY)
 
                     // Start position updates
@@ -2359,7 +2441,8 @@ class AvPlayerAdapter(
     /** mpv's `playing()` for a load that is meant to play; a paused load (precache, restore) stays READY. */
     private fun onEngineReady(handle: Int) {
         if (!isListened(handle)) return
-        if (internalPlayWhenReady) markPlaying()
+        // A load meant to play is still loading until audio actually starts (onEnginePlaying).
+        if (internalPlayWhenReady) markPlaying() else finishAwaitingEngineStart()
     }
 
     /** mpv's `playing()`. */
@@ -2370,6 +2453,7 @@ class AvPlayerAdapter(
         pendingPausedJob = null
         // A late "playing" from before a pause the user already made must not flip the UI back.
         if (!internalPlayWhenReady) return
+        finishAwaitingEngineStart()
         markPlaying()
     }
 
@@ -2418,6 +2502,10 @@ class AvPlayerAdapter(
             pendingPausedJob?.cancel()
             pendingPausedJob = null
         }
+        // The initial buffering of a fresh load is already reported as loading, and its end is
+        // announced by onEnginePlaying (buffering=false arrives just before playing=true).
+        if (awaitingEngineStart) return
+
         // During crossfade, ignore buffering events from old player
         if (isCrossfading) return
 
