@@ -336,7 +336,91 @@ class AvPlayerAdapter(
         val url: String,
         // A live broadcast's HLS playlist: the engine gets live = true (no duration, no onEnded).
         val isLive: Boolean = false,
+        // The stream's real length from YouTube (0 = unknown, use the engine's); see trueDurations.
+        val trueDurationMs: Long = 0L,
     )
+
+    // ========== True length (AVPlayer over-reports YouTube's fragmented MP4) ==========
+
+    /**
+     * Per handle, the length YouTube states for the loaded stream. AVPlayer reads the duration of
+     * itag 140 (DASH-style fragmented MP4, no usable mvhd/mehd duration) by estimating, and on a
+     * phone it comes out far too long — often double — and then plays silence up to that length
+     * before onEnded. Where this is known it replaces the engine's duration, caps the position and
+     * ends the track (see [checkTrueEndInternal]). Written on the serial context only; replaced
+     * whole so other threads can read it.
+     */
+    @Volatile
+    private var trueDurations: Map<Int, Long> = emptyMap()
+
+    /** Handles ended by [checkTrueEndInternal]: their engine onEnded, if it ever comes, is a repeat. */
+    private val trueEndedHandles = HashSet<Int>()
+
+    private fun trueDurationMs(handle: Int): Long = if (handle == NO_HANDLE) 0L else trueDurations[handle] ?: 0L
+
+    /** The length to use for [handle]: YouTube's when known, else the engine's. */
+    private fun effectiveDurationMs(handle: Int): Long {
+        if (handle == NO_HANDLE) return 0L
+        val known = trueDurationMs(handle)
+        return if (known > 0L) known else engine.durationMs(handle)
+    }
+
+    /** The engine's position for [handle], never past its true length. */
+    private fun effectivePositionMs(handle: Int): Long {
+        if (handle == NO_HANDLE) return 0L
+        val pos = engine.positionMs(handle)
+        val known = trueDurationMs(handle)
+        return if (known > 0L) pos.coerceAtMost(known) else pos
+    }
+
+    /** [positionMs] kept inside [handle]'s true length (a seek past it would only play silence). */
+    private fun clampToTrueLength(
+        handle: Int,
+        positionMs: Long,
+    ): Long {
+        val known = trueDurationMs(handle)
+        return if (known > 0L) positionMs.coerceAtMost(known) else positionMs
+    }
+
+    /**
+     * Ends the current track when the engine's clock reaches its true length — exactly what the
+     * engine's onEnded does ([onEngineEnded]), which for these streams would only come once the
+     * over-long length had been played out in silence. Called from the position poll.
+     */
+    private fun checkTrueEndInternal() {
+        val player = currentPlayer
+        if (player == NO_HANDLE || internalState != InternalState.PLAYING || isCrossfading) return
+        if (!isListened(player) || player in trueEndedHandles) return
+        val known = trueDurationMs(player)
+        if (known <= 0L) return
+        val pos = engine.positionMs(player)
+        if (pos < known - TRUE_END_TOLERANCE_MS) return
+        Logger.d(TAG, "True end reached at ${pos}ms (true length ${known}ms, engine ${engine.durationMs(player)}ms)")
+        trueEndedHandles.add(player)
+        pendingPausedJob?.cancel()
+        pendingPausedJob = null
+        // Stop the silence: nothing after this point is audio.
+        engine.pause(player)
+        transitionToState(InternalState.ENDED)
+        handleTrackEndInternal()
+    }
+
+    /**
+     * The true length of [url]: the `dur=` (seconds, ms precision) googlevideo puts on every
+     * adaptive-format URL — it is the format's own approxDurationMs — else the video's
+     * lengthSeconds (whole seconds, so rounded up a second to never cut the tail). 0 for HLS,
+     * whose playlist AVPlayer measures correctly.
+     */
+    private fun trueDurationOf(
+        url: String,
+        isLive: Boolean,
+        lengthSeconds: Int?,
+    ): Long {
+        if (isLive || url.contains(".m3u8") || url.contains("manifest")) return 0L
+        val dur = DUR_PARAM.find(url)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
+        if (dur != null && dur > 0.0) return (dur * 1000.0).toLong()
+        return lengthSeconds?.takeIf { it > 0 }?.let { (it + 1) * 1000L } ?: 0L
+    }
 
     // ========== Playback Control ==========
 
@@ -358,6 +442,7 @@ class AvPlayerAdapter(
                     if (internalState == InternalState.ENDED) {
                         Logger.d(TAG, "Play: replaying from the start after end of queue")
                         engine.seek(player, 0L)
+                        trueEndedHandles.remove(player)
                     }
                     Logger.d(TAG, "Play: calling engine play")
                     engine.play(player)
@@ -476,11 +561,14 @@ class AvPlayerAdapter(
                     commitIncomingAsCurrent()
                 }
                 currentPlayer.takeIf { it != NO_HANDLE }?.let { player ->
-                    engine.seek(player, positionMs)
-                    Logger.d(TAG, "Seeked to position: $positionMs")
+                    // Past the true end there is only silence; land on the end and let the poll end it.
+                    val target = clampToTrueLength(player, positionMs)
+                    engine.seek(player, target)
+                    if (target < trueDurationMs(player) - TRUE_END_TOLERANCE_MS) trueEndedHandles.remove(player)
+                    Logger.d(TAG, "Seeked to position: $target")
                     // Same contract as the Android adapter: every seek is reported, whoever asked
                     // for it (seek bar, lyric tap, ±5 s, Control Center, SponsorBlock).
-                    notifyListeners { onSeeked(positionMs) }
+                    notifyListeners { onSeeked(target) }
                 }
             } finally {
                 // A later seek may already have replaced it; only clear our own.
@@ -942,23 +1030,21 @@ class AvPlayerAdapter(
             val pending = pendingSeekPositionMs
             if (pending >= 0) return pending
             if (internalState == InternalState.PREPARING) return preparingStartMs
-            val handle = displayHandle()
-            return if (handle == NO_HANDLE) 0L else engine.positionMs(handle)
+            return effectivePositionMs(displayHandle())
         }
 
     override val duration: Long
         get() {
             // Not known yet for the item being prepared (ExoPlayer: C.TIME_UNSET); see preparingStartMs.
             if (internalState == InternalState.PREPARING) return 0L
-            val handle = displayHandle()
-            return if (handle == NO_HANDLE) 0L else engine.durationMs(handle)
+            return effectiveDurationMs(displayHandle())
         }
 
     override val bufferedPosition: Long
         get() {
             if (internalState == InternalState.PREPARING) return 0L
             val handle = displayHandle()
-            return if (handle == NO_HANDLE) 0L else engine.bufferedMs(handle)
+            return if (handle == NO_HANDLE) 0L else clampToTrueLength(handle, engine.bufferedMs(handle))
         }
 
     override val bufferedPercentage: Int
@@ -1400,7 +1486,7 @@ class AvPlayerAdapter(
                         // The precached handle already has the item loaded and held paused;
                         // seeking (if asked) and unpausing is all that is needed.
                         if (startPositionMs > 0) {
-                            engine.seek(player, startPositionMs)
+                            engine.seek(player, clampToTrueLength(player, startPositionMs))
                         }
                         if (shouldPlay) {
                             engine.play(player)
@@ -1450,7 +1536,12 @@ class AvPlayerAdapter(
         startPaused: Boolean,
         startMs: Long = 0L,
     ) {
-        engine.load(player, source.url, emptyMap(), startMs, !startPaused, source.isLive)
+        // Recorded before load() so the first duration read already has it; a reused handle drops
+        // the previous item's entry.
+        trueDurations =
+            if (source.trueDurationMs > 0L) trueDurations + (player to source.trueDurationMs) else trueDurations - player
+        trueEndedHandles.remove(player)
+        engine.load(player, source.url, emptyMap(), clampToTrueLength(player, startMs), !startPaused, source.isLive)
         applyPlaybackLevels(player)
     }
 
@@ -1487,6 +1578,8 @@ class AvPlayerAdapter(
     private fun releaseHandle(handle: Int) {
         if (handle == NO_HANDLE) return
         fadeGains.remove(handle)
+        trueDurations = trueDurations - handle
+        trueEndedHandles.remove(handle)
         engine.release(handle)
     }
 
@@ -1721,8 +1814,8 @@ class AvPlayerAdapter(
                     // Calculate effective crossfade duration based on ACTUAL remaining time.
                     val actualTimeRemaining =
                         currentPlayer.takeIf { it != NO_HANDLE }?.let { player ->
-                            val dur = engine.durationMs(player)
-                            val pos = engine.positionMs(player)
+                            val dur = effectiveDurationMs(player)
+                            val pos = effectivePositionMs(player)
                             if (dur > 0 && pos >= 0) (dur - pos) else resolvedConfigDurationMs.toLong()
                         } ?: resolvedConfigDurationMs.toLong()
 
@@ -1972,6 +2065,10 @@ class AvPlayerAdapter(
                 while (isActive && currentPlayer != NO_HANDLE) {
                     try {
                         if (internalState.isInReadyState()) {
+                            // The engine's own end comes too late for streams it over-measures.
+                            checkTrueEndInternal()
+                        }
+                        if (internalState.isInReadyState()) {
                             // Check if should trigger crossfade.
                             // Use currentPlayer's time (not the timeline player) for trigger detection.
                             // Block when paused (internalPlayWhenReady=false) to prevent
@@ -1990,8 +2087,8 @@ class AvPlayerAdapter(
                             ) {
                                 val player = currentPlayer
                                 if (player != NO_HANDLE) {
-                                    val dur = engine.durationMs(player)
-                                    val pos = engine.positionMs(player)
+                                    val dur = effectiveDurationMs(player)
+                                    val pos = effectivePositionMs(player)
                                     if (dur > 0 && pos > 0) {
                                         val timeRemaining = dur - pos
                                         val nextVideoId = playlist.getOrNull(getNextMediaItemIndex())?.mediaId
@@ -2324,7 +2421,11 @@ class AvPlayerAdapter(
                 val is403Url = streamRepository.is403Url(audioUrl).firstOrNull() != false
                 if (!is403Url) {
                     Logger.w("Stream", "Audio from format")
-                    return PlayableSource(isVideo = false, url = audioUrl)
+                    return PlayableSource(
+                        isVideo = false,
+                        url = audioUrl,
+                        trueDurationMs = trueDurationOf(audioUrl, isLive = false, lengthSeconds = format.lengthSeconds),
+                    )
                 }
             }
         }
@@ -2341,7 +2442,15 @@ class AvPlayerAdapter(
         if (audioUrl != null) {
             Logger.d(TAG, "Stream Audio $audioUrl")
             // getStream above is also where a live broadcast is first recognised.
-            return PlayableSource(isVideo = false, url = audioUrl, isLive = LiveStreamRegistry.isLive(videoId))
+            val isLive = LiveStreamRegistry.isLive(videoId)
+            // getStream has just stored the format row; its lengthSeconds backs up a URL without dur=.
+            val lengthSeconds = if (isLive) null else streamRepository.getNewFormat(videoId).lastOrNull()?.lengthSeconds
+            return PlayableSource(
+                isVideo = false,
+                url = audioUrl,
+                isLive = isLive,
+                trueDurationMs = trueDurationOf(audioUrl, isLive, lengthSeconds),
+            )
         }
 
         return null
@@ -2529,6 +2638,11 @@ class AvPlayerAdapter(
             Logger.w(TAG, "Ignoring onEnded() from stale player")
             return
         }
+        // Already ended at its true length (checkTrueEndInternal); this is the over-long one.
+        if (handle in trueEndedHandles) {
+            Logger.d(TAG, "Ignoring onEnded() after the true end was handled")
+            return
+        }
         // During crossfade, the old player will naturally finish near the end.
         // Ignore it - the crossfade is already handling the transition.
         if (isCrossfading) {
@@ -2711,7 +2825,7 @@ class AvPlayerAdapter(
             }
         } else {
             val live = LiveStreamRegistry.isLive(item.mediaId)
-            val durationMs = if (live || active == NO_HANDLE) 0L else engine.durationMs(active).coerceAtLeast(0L)
+            val durationMs = if (live || active == NO_HANDLE) 0L else effectiveDurationMs(active).coerceAtLeast(0L)
             if (item !== sentNowPlayingItem ||
                 active != sentNowPlayingHandle ||
                 durationMs != sentNowPlayingDurationMs ||
@@ -2786,5 +2900,11 @@ class AvPlayerAdapter(
 
         /** How long a system "not playing" waits for a stall or onEnded to explain it. */
         private const val PAUSE_SETTLE_MS = 400L
+
+        /** How close to the true length counts as its end (under one position poll). */
+        private const val TRUE_END_TOLERANCE_MS = 150L
+
+        /** googlevideo's `dur=` query parameter: the stream's length in seconds. */
+        private val DUR_PARAM = Regex("""[?&]dur=([0-9]+(?:\.[0-9]+)?)""")
     }
 }
