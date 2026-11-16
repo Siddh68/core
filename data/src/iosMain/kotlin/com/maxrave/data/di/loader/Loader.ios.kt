@@ -15,9 +15,11 @@ import org.koin.core.context.loadKoinModules
 import org.koin.core.qualifier.named
 import org.koin.dsl.module
 
-// The iOS player arrives in Phase 2. Until then createMediaServiceHandler returns a no-op handler,
-// but shared code still resolves the service scope, the player cache and the download handler,
-// so bind stand-ins that hold nothing and do nothing.
+// The service scope is what createMediaServiceHandler hands to IosMediaPlayerHandlerImpl (and through
+// it to AvPlayerAdapter, which derives its own serial context from it). Unlike Desktop, no
+// MediaPlayerInterface is bound: the iOS handler builds its AvPlayerAdapter itself from
+// NativePlayerRegistry.engine and makes no Koin lookups. Shared code still resolves the player
+// cache and the download handler; those stay stand-ins that hold nothing until Phase 3.5.
 actual fun loadMediaService() {
     loadKoinModules(
         module {
