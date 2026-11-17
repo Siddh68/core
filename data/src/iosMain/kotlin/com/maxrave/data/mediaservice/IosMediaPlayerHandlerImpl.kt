@@ -1239,13 +1239,24 @@ class IosMediaPlayerHandlerImpl(
                         _sleepTimerState.update {
                             it.copy(isDone = false, timeRemaining = -1)
                         }
-                        // Poll until player duration is available (may be -1 initially)
-                        var duration = player.duration
-                        while (duration <= 0L) {
-                            delay(500)
-                            duration = player.duration
+                        // Follow the playhead instead of sleeping for the time left when the timer was
+                        // set: a pause, a seek or a skip would otherwise make it stop playback in the
+                        // middle of a song. Polled, so it also survives the app being suspended while
+                        // paused in the background (delay() does not advance while iOS suspends it).
+                        val fadeAndTailMs = sleepFadeDurationMs + sleepFadeTailMs
+                        var remaining: Long
+                        while (true) {
+                            val duration = player.duration
+                            remaining = (duration - player.currentPosition).coerceAtLeast(0L)
+                            if (duration > 0L && player.isPlaying && remaining <= fadeAndTailMs) break
+                            delay(
+                                if (duration > 0L && player.isPlaying) {
+                                    (remaining - fadeAndTailMs).coerceIn(50L, 500L)
+                                } else {
+                                    500L
+                                },
+                            )
                         }
-                        val remaining = (duration - player.currentPosition).coerceAtLeast(0L)
                         // Fade over the tail of the track rather than after it, so the song is
                         // already silent by the time it ends. A track with less time left than the
                         // fade gets a shorter one instead of bleeding into whatever plays next.
@@ -1253,7 +1264,6 @@ class IosMediaPlayerHandlerImpl(
                         // run past the end of the track and pause somewhere inside the next one.
                         val fadeMs = sleepFadeDurationMs.coerceAtMost(remaining)
                         val tailMs = sleepFadeTailMs.coerceAtMost(remaining - fadeMs)
-                        delay(remaining - fadeMs - tailMs)
                         fadeOutForSleep(fadeMs)
                         delay(tailMs)
                         player.pause()
@@ -1265,22 +1275,32 @@ class IosMediaPlayerHandlerImpl(
                         _sleepTimerState.update {
                             it.copy(isDone = false, timeRemaining = minutes)
                         }
-                        var count = minutes
-                        while (count > 0) {
-                            // The fade belongs inside the final minute, so shorten that wait by its length.
-                            val isFinalMinute = count == 1
-                            delay(
-                                if (isFinalMinute) 60 * 1000L - sleepFadeDurationMs - sleepFadeTailMs else 60 * 1000L,
-                            )
-                            if (isFinalMinute) {
-                                fadeOutForSleep(sleepFadeDurationMs)
-                                delay(sleepFadeTailMs)
+                        // Counted against the wall clock, not by chaining one-minute delays: iOS
+                        // suspends the app in the background once nothing is playing, and a delay
+                        // does not advance while suspended, so a chain of them would drift by every
+                        // suspended stretch. The fade belongs inside the final minute.
+                        val fadeAndTailMs = sleepFadeDurationMs + sleepFadeTailMs
+                        val deadlineMs = wallClockMs() + minutes * 60_000L
+                        while (true) {
+                            val leftMs = deadlineMs - wallClockMs()
+                            if (leftMs <= fadeAndTailMs) break
+                            val minutesLeft = ((leftMs + 59_999L) / 60_000L).toInt()
+                            if (_sleepTimerState.value.timeRemaining != minutesLeft) {
+                                _sleepTimerState.update {
+                                    it.copy(isDone = false, timeRemaining = minutesLeft)
+                                }
                             }
-                            count--
-                            _sleepTimerState.update {
-                                it.copy(isDone = false, timeRemaining = count)
-                            }
+                            // Wake at the next minute boundary (to update the count) or at the start
+                            // of the fade, whichever comes first; at most every second, so time spent
+                            // suspended is noticed promptly once the app runs again.
+                            val toNextMinute = leftMs - (minutesLeft - 1) * 60_000L
+                            delay(minOf(toNextMinute, leftMs - fadeAndTailMs, 1_000L).coerceAtLeast(1L))
                         }
+                        _sleepTimerState.update {
+                            it.copy(isDone = false, timeRemaining = 1)
+                        }
+                        fadeOutForSleep(sleepFadeDurationMs)
+                        delay(sleepFadeTailMs)
                         player.pause()
                         stoppedPlayback = true
                         _sleepTimerState.update {
@@ -3064,3 +3084,7 @@ class IosMediaPlayerHandlerImpl(
         }
     }
 }
+
+/** Wall-clock milliseconds: keeps counting while iOS has the app suspended, unlike delay(). */
+@OptIn(kotlin.time.ExperimentalTime::class)
+private fun wallClockMs(): Long = kotlin.time.Clock.System.now().toEpochMilliseconds()

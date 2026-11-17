@@ -34,7 +34,8 @@ private const val TAG = "Extractor"
  * its response carries plain `url`s (no `signatureCipher`, no `n` challenge) that the CDN serves
  * at any byte offset without a PO token, plus an HLS manifest. The iOS app client looks the same
  * but is refused past the first megabyte; the TV and web clients are refused outright without a
- * signed-in session. Measured on 2026-11-16, 5 of 5 tracks read end to end.
+ * signed-in session. Measured on 2026-11-17: 50 of 50 varied tracks served itag 140 at a mid-file
+ * byte range and a working HLS manifest; only age-gated videos are refused (see [streamingData]).
  *
  * Constants mirror PipePipe's `ClientsConstants` (VISIONOS_*) so the two can be bumped together.
  *
@@ -55,7 +56,7 @@ actual class Extractor {
     actual fun logIn(cookie: String?) {}
 
     actual fun newPipePlayer(videoId: String): List<Pair<Int, String>> {
-        val streamingData = streamingData(videoId) ?: return emptyList()
+        val (streamingData, source) = streamingData(videoId) ?: return emptyList()
         val streams = mutableListOf<Pair<Int, String>>()
         for (key in listOf("formats", "adaptiveFormats")) {
             streamingData[key]?.jsonArray?.forEach { element ->
@@ -67,50 +68,67 @@ actual class Extractor {
         }
         // YouTube.newPipePlayer reads the HLS manifest from the pseudo-itag 96, as PipePipe reports it.
         streamingData["hlsManifestUrl"]?.jsonPrimitive?.content?.let { streams.add(HLS_ITAG to it) }
-        if (streams.isNotEmpty()) ExtractSource.record(videoId, "visionOS")
-        Logger.i(TAG, "extract source=visionOS itags=${streams.map { it.first }} for $videoId")
+        if (streams.isNotEmpty()) ExtractSource.record(videoId, source)
+        Logger.i(TAG, "extract source=$source itags=${streams.map { it.first }} for $videoId")
         return streams
     }
 
-    actual fun liveHlsUrl(videoId: String): String? =
-        streamingData(videoId)
-            ?.get("hlsManifestUrl")
+    actual fun liveHlsUrl(videoId: String): String? {
+        val (streamingData, source) = streamingData(videoId) ?: return null
+        return streamingData["hlsManifestUrl"]
             ?.jsonPrimitive
             ?.content
-            ?.also { ExtractSource.record(videoId, "visionOS · live") }
+            ?.also { ExtractSource.record(videoId, "$source · live") }
+    }
 
     /**
-     * `streamingData` of the visionOS player response, or null when YouTube refused.
+     * `streamingData` of the visionOS player response and the source that served it, or null when
+     * YouTube refused.
      *
      * A refusal is retried once with a fresh visitor id: an id that has gone stale is the one
      * failure this client can recover from by itself.
+     *
+     * Fallback tier: when an attempt on [API_URL] never got an answer (DNS, TLS, HTTP error), the
+     * same request goes to the youtube.com InnerTube host, which serves visionOS identically
+     * (probed 2026-11-17: 50 of 50 tracks on both). A refusal is not sent there: YouTube gives the
+     * same answer on every host. No other anonymous client is a usable fallback today (same probe):
+     * IOS and ANDROID_VR answer OK but their CDN URLs are refused past the first megabyte without a
+     * PO token and IOS no longer returns an HLS manifest; ANDROID returns ciphered URLs; TVHTML5
+     * asks for sign-in; the embedded players are refused; WEB, MWEB and WEB_REMIX say "the page
+     * needs to be reloaded"; IOS_MUSIC and ANDROID_MUSIC ask for sign-in. Age-gated videos are
+     * refused by every one of them.
      */
-    private fun streamingData(videoId: String): JsonObject? =
+    private fun streamingData(videoId: String): Pair<JsonObject, String>? =
         runBlocking {
-            repeat(2) { attempt ->
-                try {
-                    val visitor = visitorData ?: fetchVisitorData().also { visitorData = it }
-                    val response = post("player", "&t=${randomToken(12)}&id=$videoId", playerBody(videoId, visitor))
-                    val status = response["playabilityStatus"]?.jsonObject
-                    val streamingData = response["streamingData"]?.jsonObject
-                    if (status?.get("status")?.jsonPrimitive?.content == "OK" && streamingData != null) {
-                        return@runBlocking streamingData
+            for ((apiUrl, source) in listOf(API_URL to "visionOS", FALLBACK_API_URL to "visionOS · youtube.com")) {
+                var unanswered = false
+                repeat(2) { attempt ->
+                    try {
+                        val visitor = visitorData ?: fetchVisitorData(apiUrl).also { visitorData = it }
+                        val response = post(apiUrl, "player", "&t=${randomToken(12)}&id=$videoId", playerBody(videoId, visitor))
+                        val status = response["playabilityStatus"]?.jsonObject
+                        val streamingData = response["streamingData"]?.jsonObject
+                        if (status?.get("status")?.jsonPrimitive?.content == "OK" && streamingData != null) {
+                            return@runBlocking streamingData to source
+                        }
+                        Logger.w(
+                            TAG,
+                            "$source player refused $videoId (attempt ${attempt + 1}): " +
+                                "${status?.get("status")?.jsonPrimitive?.content} ${status?.get("reason")?.jsonPrimitive?.content}",
+                        )
+                    } catch (e: Exception) {
+                        unanswered = true
+                        Logger.w(TAG, "$source player failed for $videoId (attempt ${attempt + 1}): ${e.message}")
                     }
-                    Logger.w(
-                        TAG,
-                        "visionOS player refused $videoId (attempt ${attempt + 1}): " +
-                            "${status?.get("status")?.jsonPrimitive?.content} ${status?.get("reason")?.jsonPrimitive?.content}",
-                    )
-                } catch (e: Exception) {
-                    Logger.w(TAG, "visionOS player failed for $videoId (attempt ${attempt + 1}): ${e.message}")
+                    visitorData = null
                 }
-                visitorData = null
+                if (!unanswered) break
             }
             null
         }
 
-    private suspend fun fetchVisitorData(): String =
-        post("visitor_id", "", context(null))["responseContext"]
+    private suspend fun fetchVisitorData(apiUrl: String): String =
+        post(apiUrl, "visitor_id", "", context(null))["responseContext"]
             ?.jsonObject
             ?.get("visitorData")
             ?.jsonPrimitive
@@ -119,12 +137,13 @@ actual class Extractor {
             ?: throw IllegalStateException("no visitorData in response")
 
     private suspend fun post(
+        apiUrl: String,
         endpoint: String,
         extraQuery: String,
         body: JsonObject,
     ): JsonObject {
         val response =
-            client.post("$API_URL$endpoint?prettyPrint=false$extraQuery") {
+            client.post("$apiUrl$endpoint?prettyPrint=false$extraQuery") {
                 header("Content-Type", "application/json")
                 header("User-Agent", USER_AGENT)
                 header("X-Goog-Api-Format-Version", "2")
@@ -187,6 +206,7 @@ actual class Extractor {
 
     private companion object {
         const val API_URL = "https://youtubei.googleapis.com/youtubei/v1/"
+        const val FALLBACK_API_URL = "https://www.youtube.com/youtubei/v1/"
         const val CLIENT_NAME = "VISIONOS"
         const val CLIENT_VERSION = "1.02"
         const val DEVICE_MODEL = "RealityDevice14,1"
