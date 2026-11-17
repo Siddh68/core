@@ -78,7 +78,59 @@ object TrackStructureAnalyzer {
             musicEndMs = musicEndMs,
             introEndMs = introEnd?.let { toMs(barLines[it]) }?.takeIf { it <= MAX_INTRO_MS },
             lastChorusEndMs = lastChorusEnd?.let { toMs(barLines[it]) }?.takeIf { musicEndMs - it <= MAX_OUTRO_MS },
+            beatConfidence = beatConfidence(onset, beats, period),
         )
+    }
+
+    /**
+     * How well the tracked beats describe the music, 0..1, as the product of three checks:
+     * - contrast: onset strength on the beats against half way between them (full at 2x);
+     * - regularity: share of beat gaps within 6% of the period (the tracker had to bend for the rest);
+     * - steadiness: how closely the beats follow one constant tempo across the track, which live
+     *   recordings with drifting tempo fail even when every local gap is fine.
+     */
+    internal fun beatConfidence(
+        onset: DoubleArray,
+        beats: IntArray,
+        period: Double,
+    ): Double {
+        if (beats.size < 8 || period <= 0) return 0.0
+        fun peak(i: Int): Double {
+            var m = 0.0
+            for (j in max(0, i - 1)..min(onset.size - 1, i + 1)) m = max(m, onset[j])
+            return m
+        }
+        var on = 0.0
+        var off = 0.0
+        var regular = 0
+        for (k in 0 until beats.size - 1) {
+            val gap = beats[k + 1] - beats[k]
+            on += peak(beats[k])
+            off += peak(beats[k] + gap / 2)
+            if (abs(gap - period) <= period * 0.06) regular++
+        }
+        val count = beats.size - 1
+        val contrast = (on / max(off, 1e-9) - 1.0).coerceIn(0.0, 1.0)
+        val regularity = regular.toDouble() / count
+        // Least-squares line through beat index → frame; the residual in periods is the drift.
+        val n = beats.size.toDouble()
+        val meanX = (n - 1) / 2
+        val meanY = beats.average()
+        var sxy = 0.0
+        var sxx = 0.0
+        for (k in beats.indices) {
+            sxy += (k - meanX) * (beats[k] - meanY)
+            sxx += (k - meanX) * (k - meanX)
+        }
+        val slope = sxy / sxx
+        var squares = 0.0
+        for (k in beats.indices) {
+            val r = beats[k] - (meanY + slope * (k - meanX))
+            squares += r * r
+        }
+        val drift = sqrt(squares / n) / period
+        val steadiness = (1.0 - drift / 2.0).coerceIn(0.0, 1.0)
+        return ((contrast * regularity * steadiness) * 100).roundToInt() / 100.0
     }
 
     private fun toMs(frame: Int): Long = (frame * 1000 / FPS).toLong()

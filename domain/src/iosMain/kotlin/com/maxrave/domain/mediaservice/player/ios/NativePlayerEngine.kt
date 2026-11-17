@@ -50,6 +50,19 @@ interface NativePlayerEngine {
     /** Stop, drop the item, forget the handle. Unknown handles are ignored. No event follows. */
     fun release(handle: Int)
 
+    /**
+     * DJ join (`docs/ios-player-bridge.md` §7): start [handle] — loaded, ready and paused at its start
+     * position — so that position is heard exactly when [refHandle]'s item reaches [refMs], using
+     * `AVPlayer.setRate(_:time:atHostTime:)` after a preroll. Late (the moment has passed) it starts
+     * at once with its position advanced by the lateness, so the two stay aligned. Nothing happens
+     * while [refHandle] is not playing; a not-yet-ready [handle] starts like [play]. pause() cancels it.
+     */
+    fun playSynced(
+        handle: Int,
+        refHandle: Int,
+        refMs: Long,
+    )
+
     // Reads: callable from any thread, never block.
 
     /** Extrapolated between observer ticks, smooth enough for word-by-word lyrics. */
@@ -79,6 +92,12 @@ interface NativePlayerEngine {
     )
 
     fun clearNowPlaying()
+
+    /**
+     * Lock-screen elapsed time = the active handle's position + [offsetMs], until the next
+     * [setActiveHandle] (which resets it to 0). Used while a rendered DJ segment plays.
+     */
+    fun setActivePositionOffset(offsetMs: Long)
 
     /** Greys out next/previous on the lock screen. Play, pause, toggle and seek are always on. */
     fun setRemoteCommandsEnabled(

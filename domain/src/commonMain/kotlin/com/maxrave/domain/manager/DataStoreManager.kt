@@ -470,6 +470,20 @@ interface DataStoreManager {
     suspend fun setCrossfadeSkipAlbum(enabled: Boolean)
 
     /**
+     * How adventurous DJ transitions are (with DJ mode on): `SMOOTH` keeps to blends and filter
+     * sweeps, `CLUB` (default) also uses echo-outs, brakes, drop cuts and rises.
+     * Values are `DjIntensity` names.
+     */
+    val djIntensity: Flow<String>
+
+    suspend fun setDjIntensity(intensity: String)
+
+    /** With DJ mode on, pressing Next mixes into the next track in 2-4 s instead of cutting. On by default. */
+    val djSkipTransitions: Flow<String>
+
+    suspend fun setDjSkipTransitions(enabled: Boolean)
+
+    /**
      * When on, liking a song also queues it for offline download, at the existing download quality.
      *
      * Off by default — it spends storage and data without the user asking each time. Only applies

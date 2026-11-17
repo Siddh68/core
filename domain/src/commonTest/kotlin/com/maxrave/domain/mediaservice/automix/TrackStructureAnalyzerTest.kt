@@ -74,4 +74,37 @@ class TrackStructureAnalyzerTest {
         assertEquals(structure, TrackStructure.decode(structure.encode()))
         assertNull(TrackStructure.decode(""))
     }
+
+    @Test
+    fun `a steady kick reads as a confident grid`() {
+        val structure = assertNotNull(TrackStructureAnalyzer.analyze(synth()))
+        assertTrue(structure.beatConfidence >= DjBrain.MIN_BEAT_CONFIDENCE, "confidence ${structure.beatConfidence}")
+    }
+
+    @Test
+    fun `a pulse without a steady beat reads as low confidence`() {
+        // 60 s of a sustained chord with soft hits at random gaps: sound enough to analyse, no tempo.
+        val random = kotlin.random.Random(7)
+        val total = 60 * rate
+        val pcm = ShortArray(total)
+        var nextHit = 0
+        var lastHit = -100_000
+        for (i in pcm.indices) {
+            if (i >= nextHit) {
+                lastHit = i
+                nextHit = i + (rate * (0.25 + random.nextDouble() * 0.9)).toInt()
+            }
+            val t = i.toDouble() / rate
+            val since = (i - lastHit).toDouble() / rate
+            val hit = 0.3 * exp(-since * 25) * sin(2 * PI * 60.0 * since)
+            val pad = 0.05 * sin(2 * PI * 220.0 * t) + 0.04 * sin(2 * PI * 330.0 * t)
+            pcm[i] = ((hit + pad) * 32767).toInt().coerceIn(-32768, 32767).toShort()
+        }
+        val structure = TrackStructureAnalyzer.analyze(pcm)
+        val steady = assertNotNull(TrackStructureAnalyzer.analyze(synth()))
+        if (structure != null) {
+            assertTrue(structure.beatConfidence < steady.beatConfidence, "random ${structure.beatConfidence} vs steady ${steady.beatConfidence}")
+            assertTrue(structure.beatConfidence < DjBrain.MIN_BEAT_CONFIDENCE, "random ${structure.beatConfidence}")
+        }
+    }
 }

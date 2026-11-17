@@ -1510,6 +1510,32 @@ internal class DataStoreManagerImpl(
         }
     }
 
+    override val djIntensity: Flow<String> =
+        settingsDataStore.data.map { preferences ->
+            preferences[DJ_INTENSITY] ?: "CLUB"
+        }
+
+    override suspend fun setDjIntensity(intensity: String) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                settings[DJ_INTENSITY] = intensity
+            }
+        }
+    }
+
+    override val djSkipTransitions: Flow<String> =
+        settingsDataStore.data.map { preferences ->
+            preferences[DJ_SKIP_TRANSITIONS] ?: TRUE
+        }
+
+    override suspend fun setDjSkipTransitions(enabled: Boolean) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                settings[DJ_SKIP_TRANSITIONS] = if (enabled) TRUE else FALSE
+            }
+        }
+    }
+
     // Defaults to FALSE: it spends storage and mobile data on the user's behalf.
     override val autoDownloadLikedSongs: Flow<String> =
         settingsDataStore.data.map { preferences ->
@@ -1910,6 +1936,8 @@ internal class DataStoreManagerImpl(
         val CROSSFADE_DURATION = intPreferencesKey("crossfade_duration")
         val CROSSFADE_DJ_MODE = stringPreferencesKey("crossfade_dj_mode")
         val CROSSFADE_SKIP_ALBUM = stringPreferencesKey("crossfade_skip_album")
+        val DJ_INTENSITY = stringPreferencesKey("dj_intensity")
+        val DJ_SKIP_TRANSITIONS = stringPreferencesKey("dj_skip_transitions")
         val AUTO_DOWNLOAD_LIKED_SONGS = stringPreferencesKey("auto_download_liked_songs")
         val SMART_DOWNLOADS_ENABLED = stringPreferencesKey("smart_downloads_enabled")
         val SMART_DOWNLOADS_COUNT = intPreferencesKey("smart_downloads_count")

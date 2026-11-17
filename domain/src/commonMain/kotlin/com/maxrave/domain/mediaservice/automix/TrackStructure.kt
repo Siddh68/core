@@ -34,12 +34,17 @@ data class TrackStructure(
      * most 30 s follows it. Null when the song ends on its chorus or loudness does not separate them.
      */
     val lastChorusEndMs: Long? = null,
+    /**
+     * 0..1: how far the beat grid can be trusted for beat-matched overlaps. Low for live tempo drift,
+     * weak or absent percussion and free intros; DJ transitions then avoid long blends.
+     */
+    val beatConfidence: Double = 0.0,
 ) {
     fun encode(): String = json.encodeToString(serializer(), this)
 
     companion object {
         /** Bump whenever the analysis changes, so results stored by an older build are measured again. */
-        const val VERSION = 2
+        const val VERSION = 3
 
         private val json =
             Json {

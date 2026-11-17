@@ -1,6 +1,9 @@
 package com.maxrave.data.mediaservice.player
 
 import com.maxrave.common.MERGING_DATA_TYPE
+import com.maxrave.data.mediaservice.dj.DjCache
+import com.maxrave.data.mediaservice.dj.DjMixPipeline
+import com.maxrave.data.mediaservice.dj.DjReadyTransition
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericPlaybackParameters
 import com.maxrave.domain.data.player.LiveStreamRegistry
@@ -274,6 +277,80 @@ class AvPlayerAdapter(
         }
     }
 
+    // ========== DJ transitions (pre-rendered A→B segments, see the DJ section below) ==========
+
+    /** Builds the transitions in the background; never touches the player. */
+    private val djPipeline = DjMixPipeline(dataStoreManager, streamRepository)
+
+    /** `crossfadeDjMode`: with crossfade on, use a rendered DJ transition when one is ready. */
+    private var djModeEnabled = false
+
+    private enum class DjPhase {
+        /** Segment and B preloaded paused; A plays as usual towards the join. */
+        ARMED,
+
+        /** The segment plays as the current handle; B waits paused at its resume point. */
+        MIXING,
+    }
+
+    private class DjSwitch(
+        val ready: DjReadyTransition,
+        val fromItem: GenericMediaItem,
+        val toItem: GenericMediaItem,
+        val aHandle: Int,
+        val mixHandle: Int,
+        var bHandle: Int,
+        val aDurationMs: Long,
+    ) {
+        var phase = DjPhase.ARMED
+        var job: Job? = null
+
+        /** playSynced sent for the segment (ARMED) / for B (MIXING); undone by pause and seek. */
+        var mixIssued = false
+        var bIssued = false
+        var identityPassed = false
+        var finishing = false
+    }
+
+    /** Serial context only. */
+    private var dj: DjSwitch? = null
+
+    /** What other threads need while the segment plays: its time mapped onto A's or B's timeline. */
+    private class DjView(
+        val mixHandle: Int,
+        val aStartMs: Long,
+        val aDurationMs: Long,
+        val bResumeMs: Long,
+        val bDurationMs: Long,
+        val mixLengthMs: Long,
+    ) {
+        @Volatile
+        var identityPassed = false
+
+        fun positionMs(mixPos: Long): Long =
+            if (!identityPassed) {
+                (aStartMs + mixPos).coerceIn(0L, if (aDurationMs > 0) aDurationMs else Long.MAX_VALUE)
+            } else {
+                (bResumeMs - (mixLengthMs - mixPos)).coerceIn(0L, if (bDurationMs > 0) bDurationMs else Long.MAX_VALUE)
+            }
+
+        fun durationMs(): Long = if (!identityPassed) aDurationMs else bDurationMs
+
+        /** Lock screen: elapsed = segment position + this. */
+        fun offsetMs(): Long = if (!identityPassed) aStartMs else bResumeMs - mixLengthMs
+    }
+
+    @Volatile
+    private var djView: DjView? = null
+
+    /** Last (current, next) handed to [djPipeline]. */
+    private var djSentPair: Pair<String?, String?>? = null
+
+    /** Pair a "ready too late" was logged for, so it is logged once. */
+    private var djLateLogged: String? = null
+
+    private var sentPositionOffset = 0L
+
     // Retry system - mirrors Android CrossfadeExoPlayerAdapter retry logic
     private var retryCount = 0
     private var retryVideoId: String? = null
@@ -507,6 +584,8 @@ class AvPlayerAdapter(
                 Logger.d(TAG, "Pause: committing incoming (A+1) and pausing in place")
                 commitIncomingAsCurrent()
             }
+            // A scheduled synced start must not fire while paused.
+            djBeforePauseInternal()
 
             when (internalState) {
                 InternalState.PLAYING, InternalState.READY -> {
@@ -548,6 +627,7 @@ class AvPlayerAdapter(
         coroutineScope.launch {
             currentPlayer.takeIf { it != NO_HANDLE }?.let { player ->
                 Logger.d(TAG, "Stop called")
+                abortDjInternal("stop")
                 // mpv's `stop` unloads the file and leaves a handle that can only be reloaded; the
                 // engine has no unload, and a released handle is the same thing for every caller
                 // below (play() in IDLE is refused, prepare() loads afresh).
@@ -576,6 +656,8 @@ class AvPlayerAdapter(
                     Logger.d(TAG, "seekTo: committing incoming (A+1) before seeking")
                     commitIncomingAsCurrent()
                 }
+                // Mid DJ segment the seek bar shows A (before B's entry) or B: that one is kept.
+                djBeforeSeekInternal()
                 currentPlayer.takeIf { it != NO_HANDLE }?.let { player ->
                     // Past the true end there is only silence; land on the end and let the poll end it.
                     val target = clampToTrueLength(player, positionMs)
@@ -586,6 +668,8 @@ class AvPlayerAdapter(
                     // for it (seek bar, lyric tap, ±5 s, Control Center, SponsorBlock).
                     notifyListeners { onSeeked(target) }
                 }
+                // Seeked back before the join: a ready transition can be armed again.
+                djRefreshInternal()
             } finally {
                 // A later seek may already have replaced it; only clear our own.
                 if (pendingSeekPositionMs == positionMs) pendingSeekPositionMs = -1L
@@ -610,6 +694,7 @@ class AvPlayerAdapter(
 
             // Cancel any ongoing load
             currentLoadJob?.cancel()
+            abortDjInternal("jump to another track")
 
             localCurrentMediaItemIndex = mediaItemIndex
             unpinCurrent()
@@ -636,6 +721,8 @@ class AvPlayerAdapter(
             // During crossfade A→A+1, "next" commits A+1 as current (the UI already shows A+1)
             // and then advances to A+2. Outside a crossfade it advances normally. hasNextMediaItem()
             // is evaluated AFTER the commit so it is relative to A+1, not A.
+            // Mid DJ segment, still showing A: Next means B, which is already playing — commit to it.
+            if (djCommitForNextInternal()) return@launch
             val wasCrossfading = isCrossfading
             if (wasCrossfading) {
                 Logger.d(TAG, "seekToNext: committing incoming (A+1), then advancing to A+2")
@@ -658,6 +745,7 @@ class AvPlayerAdapter(
                 Logger.d(TAG, "seekToPrevious: committing incoming (A+1) first")
                 commitIncomingAsCurrent()
             }
+            djCommitDisplayedInternal()
 
             // Standard music player behavior:
             // Position > 3s → seek to start of current track
@@ -687,6 +775,7 @@ class AvPlayerAdapter(
                 Logger.d(TAG, "seekToPreviousMediaItem: committing incoming (A+1) first")
                 commitIncomingAsCurrent()
             }
+            djCommitDisplayedInternal()
 
             // Always go to the previous track — skips the 3-second "seek to start"
             // rule used by seekToPrevious().
@@ -1046,6 +1135,7 @@ class AvPlayerAdapter(
             val pending = pendingSeekPositionMs
             if (pending >= 0) return pending
             if (internalState == InternalState.PREPARING) return preparingStartMs
+            djView?.let { v -> if (v.mixHandle == currentPlayer) return v.positionMs(engine.positionMs(v.mixHandle)) }
             return effectivePositionMs(displayHandle())
         }
 
@@ -1053,12 +1143,15 @@ class AvPlayerAdapter(
         get() {
             // Not known yet for the item being prepared (ExoPlayer: C.TIME_UNSET); see preparingStartMs.
             if (internalState == InternalState.PREPARING) return 0L
+            djView?.let { v -> if (v.mixHandle == currentPlayer) return v.durationMs() }
             return effectiveDurationMs(displayHandle())
         }
 
     override val bufferedPosition: Long
         get() {
             if (internalState == InternalState.PREPARING) return 0L
+            // A local segment, followed by a local file: everything is there.
+            djView?.let { v -> if (v.mixHandle == currentPlayer) return v.durationMs() }
             val handle = displayHandle()
             return if (handle == NO_HANDLE) 0L else clampToTrueLength(handle, engine.bufferedMs(handle))
         }
@@ -1224,6 +1317,13 @@ class AvPlayerAdapter(
         currentPlayer.takeIf { it != NO_HANDLE }?.let(action)
         secondaryPlayer.takeIf { it != NO_HANDLE }?.let(action)
         precachedPlayers.values.toList().forEach { action(it.player) }
+        // The DJ handles that are not current: the segment, B, and A until B's entry.
+        dj?.let { d ->
+            listOf(d.aHandle, d.mixHandle, d.bHandle)
+                .filter { it != NO_HANDLE && it != currentPlayer }
+                .distinct()
+                .forEach(action)
+        }
     }
 
     /** The one volume the engine is ever given: user level × sleep fade × crossfade gain. */
@@ -1288,6 +1388,8 @@ class AvPlayerAdapter(
             positionUpdateJob?.cancel()
             crossfadeJob?.cancel()
             pendingPausedJob?.cancel()
+            abortDjInternal("release")
+            djPipeline.release()
 
             releaseHandle(secondaryPlayer)
             secondaryPlayer = NO_HANDLE
@@ -1446,6 +1548,8 @@ class AvPlayerAdapter(
         val videoId = mediaItem.mediaId
 
         currentLoadJob?.cancel()
+        // A fresh load replaces whatever the DJ handles were doing; the current one goes with the load.
+        abortDjInternal("load")
 
         currentLoadJob =
             coroutineScope.launch {
@@ -1635,6 +1739,7 @@ class AvPlayerAdapter(
     private fun cleanupCurrentPlayerInternal() {
         stopPositionUpdates()
         cleanupEventListenerInternal()
+        abortDjInternal("player cleanup")
 
         crossfadeJob?.cancel()
         crossfadeJob = null
@@ -1718,6 +1823,8 @@ class AvPlayerAdapter(
             Logger.d(TAG, "handleTrackEndInternal: crossfade in progress, ignoring track end")
             return
         }
+        // A track that ends while a DJ switch is armed never reached the join: plain fallback.
+        abortDjInternal("track ended before the join")
 
         val shouldCrossfade =
             crossfadeEnabled &&
@@ -2081,6 +2188,495 @@ class AvPlayerAdapter(
         triggerPrecachingInternal()
     }
 
+    // ========== DJ transitions ==========
+    //
+    // With crossfade and "DJ transitions" on, [djPipeline] renders the segment between the current
+    // track A and the track the queue plays next, B (docs/ios-player-bridge.md §7). Once it is ready
+    // the switch is ARMED: the segment (a local WAV) and B (its local file, at the resume point) are
+    // loaded paused on two spare handles. At the join the engine starts the segment sample-aligned
+    // to A's clock (playSynced), A fades out under it over DJ_OVERLAP_MS (the audio is the same on
+    // both sides), and the segment becomes the current handle (MIXING). At B's melody entry the
+    // track identity moves to B; at the end of the segment B starts aligned the same way and becomes
+    // current. Anything unexpected falls back to the plain crossfade / advance.
+
+    private fun djEnabled(): Boolean = crossfadeEnabled && djModeEnabled && !crossfadeSuppressed
+
+    /** The item a DJ transition may go to from the current one: the actual next item, under the crossfade skip rules. */
+    private fun djNextItem(): GenericMediaItem? {
+        if (internalRepeatMode == PlayerConstants.REPEAT_MODE_ONE) return null
+        val current = playlist.getOrNull(localCurrentMediaItemIndex) ?: return null
+        val nextIndex = getNextMediaItemIndex()
+        if (nextIndex == localCurrentMediaItemIndex) return null
+        val next = playlist.getOrNull(nextIndex) ?: return null
+        if (next.mediaId == current.mediaId) return null
+        if (isCurrentTrackVideo() || isNextTrackVideo() || isCurrentTrackLive() || isNextTrackLive() || isWithinAlbum()) return null
+        return next
+    }
+
+    /** After every serial task: tell the pipeline what to prepare when (current, next) changed. */
+    private fun syncDjPipeline() {
+        if (released) return
+        val pair =
+            if (djEnabled()) {
+                playlist.getOrNull(localCurrentMediaItemIndex)?.mediaId to djNextItem()?.mediaId
+            } else {
+                null to null
+            }
+        if (pair == djSentPair) return
+        djSentPair = pair
+        djPipeline.update(pair.first, pair.second)
+        // Disarms a switch whose next item changed, or arms one already on disk.
+        coroutineScope.launch { djRefreshInternal() }
+    }
+
+    /** Arms the ready transition for (current, next), or drops an armed one that no longer fits. */
+    private fun djRefreshInternal() {
+        val d = dj
+        if (d != null && d.phase == DjPhase.MIXING) return
+        val current = playlist.getOrNull(localCurrentMediaItemIndex)
+        val next = if (djEnabled()) djNextItem() else null
+        val ready = djPipeline.readyFor(current?.mediaId, next?.mediaId)
+        if (d != null) {
+            val stillValid =
+                ready != null &&
+                    d.ready.a == ready.a &&
+                    d.ready.b == ready.b &&
+                    d.toItem === next &&
+                    d.fromItem === current &&
+                    d.aHandle == currentPlayer
+            if (stillValid) return
+            abortDjInternal("queue or setting changed")
+        }
+        if (ready == null || current == null || next == null) return
+        tryArmDjInternal(ready, current, next)
+    }
+
+    private fun tryArmDjInternal(
+        ready: DjReadyTransition,
+        current: GenericMediaItem,
+        next: GenericMediaItem,
+    ) {
+        val a = currentPlayer
+        if (a == NO_HANDLE || !isListened(a) || isCrossfading || !internalState.isInReadyState() || a in videoHandles) return
+        val meta = ready.meta
+        val pairKey = "${ready.a}>${ready.b}"
+        val pos = engine.positionMs(a)
+        if (pos > meta.aStartMs - DJ_ARM_LEAD_MS) {
+            if (djLateLogged != pairKey) {
+                djLateLogged = pairKey
+                Logger.i(TAG, "DJ not armed ${ready.a}→${ready.b}: ready at $pos ms, join at ${meta.aStartMs} ms")
+            }
+            return
+        }
+        // The cached copy and the stream being played must be the same recording.
+        val aDuration = effectiveDurationMs(a)
+        val aTotalMs = meta.aTotalFrames * 1000L / meta.sampleRate
+        if (aDuration > 0 && kotlin.math.abs(aDuration - aTotalMs) > DJ_DURATION_TOLERANCE_MS) {
+            if (djLateLogged != pairKey) {
+                djLateLogged = pairKey
+                Logger.w(TAG, "DJ not armed ${ready.a}→${ready.b}: playing length $aDuration ms, analysed $aTotalMs ms")
+            }
+            return
+        }
+        val mix = engine.create(false)
+        val b = engine.create(false)
+        if (mix == NO_HANDLE || b == NO_HANDLE) {
+            engine.release(mix)
+            engine.release(b)
+            return
+        }
+        // Both silent until their fade; the segment from its start, B from just before its resume
+        // point so the two overlap at the end of the segment.
+        fadeGains[mix] = 0f
+        fadeGains[b] = 0f
+        engine.load(mix, DjCache.fileUrl(ready.mixPath), emptyMap(), 0L, false, false)
+        applyPlaybackLevels(mix)
+        trueDurations = trueDurations + (b to meta.bTotalMs)
+        engine.load(b, DjCache.fileUrl(ready.bAudioPath), emptyMap(), djBStartMs(meta), false, false)
+        applyPlaybackLevels(b)
+        // B keeps its place after A under shuffle, as a crossfade target does.
+        if (internalShuffleModeEnabled) pinnedNextItems.add(next)
+        val d =
+            DjSwitch(
+                ready = ready,
+                fromItem = current,
+                toItem = next,
+                aHandle = a,
+                mixHandle = mix,
+                bHandle = b,
+                aDurationMs = if (aDuration > 0) aDuration else aTotalMs,
+            )
+        dj = d
+        d.job = coroutineScope.launch { runDjSwitch(d) }
+        Logger.i(
+            TAG,
+            "DJ armed ${ready.a}→${ready.b}: join at A ${meta.aStartMs} ms, segment ${meta.mixLengthMs} ms, " +
+                "B entry at +${meta.identityMs} ms, B resumes at ${meta.bResumeMs} ms",
+        )
+    }
+
+    /** Where B's handle waits: just before its resume point, so it overlaps the segment's end. */
+    private fun djBStartMs(meta: com.maxrave.data.mediaservice.dj.DjTransitionMeta): Long = (meta.bResumeMs - DJ_OVERLAP_MS).coerceAtLeast(0L)
+
+    private fun djSpeed(): Float = internalPlaybackSpeed.coerceAtLeast(0.25f)
+
+    /** Waits for [mediaMs] of media time at the playback speed. */
+    private suspend fun djDelay(mediaMs: Long) {
+        delay((mediaMs / djSpeed()).toLong().coerceAtLeast(1L))
+    }
+
+    /**
+     * Whether [follow] (started at its [followFromMs]) runs in step with [lead] (which was at
+     * [leadAtMs] when [follow] was meant to start), and has actually started.
+     */
+    private fun djAligned(
+        lead: Int,
+        leadAtMs: Long,
+        follow: Int,
+        followFromMs: Long,
+    ): Boolean {
+        val followed = engine.positionMs(follow) - followFromMs
+        if (followed <= 0L) return false
+        val led = engine.positionMs(lead) - leadAtMs
+        return kotlin.math.abs(followed - led) <= DJ_ALIGN_TOLERANCE_MS
+    }
+
+    /** The switch's timeline, from ARMED to B being current. Runs on the serial context. */
+    private suspend fun runDjSwitch(d: DjSwitch) {
+        val meta = d.ready.meta
+        // --- ARMED: wait for A to reach the join.
+        while (true) {
+            if (dj !== d) return
+            if (internalState != InternalState.PLAYING || !internalPlayWhenReady || currentPlayer != d.aHandle) {
+                delay(100)
+                continue
+            }
+            val remaining = meta.aStartMs - engine.positionMs(d.aHandle)
+            if (remaining < -DJ_JOIN_LATE_MS) {
+                abortDjInternal("A is past the join (${-remaining} ms)")
+                return
+            }
+            if (remaining > DJ_SYNC_LEAD_MS) {
+                djDelay((remaining - DJ_SYNC_LEAD_MS).coerceIn(20L, 500L))
+                continue
+            }
+            if (!d.mixIssued) {
+                // The engine starts it at the join itself, from A's own clock.
+                engine.playSynced(d.mixHandle, d.aHandle, meta.aStartMs)
+                d.mixIssued = true
+            }
+            if (remaining > 0) {
+                djDelay(remaining.coerceAtMost(10L))
+                continue
+            }
+            break
+        }
+        // The segment has to be running, in step with A, before A goes; otherwise A just goes on.
+        var waited = 0L
+        while (!djAligned(d.aHandle, meta.aStartMs, d.mixHandle, 0L) && waited < DJ_START_TIMEOUT_MS) {
+            delay(10)
+            waited += 10
+        }
+        if (dj !== d) return
+        if (!djAligned(d.aHandle, meta.aStartMs, d.mixHandle, 0L)) {
+            abortDjInternal(
+                "segment not in step at the join (A +${engine.positionMs(d.aHandle) - meta.aStartMs} ms, " +
+                    "segment ${engine.positionMs(d.mixHandle)} ms)",
+            )
+            return
+        }
+        val joinError = (engine.positionMs(d.mixHandle)) - (engine.positionMs(d.aHandle) - meta.aStartMs)
+        djRamp(d.aHandle, d.mixHandle)
+        if (dj !== d) return
+
+        // --- MIXING: the segment is the current handle; A stays paused (muted) until B's entry,
+        // so a seek before it can still go back to A.
+        d.phase = DjPhase.MIXING
+        val view =
+            DjView(
+                mixHandle = d.mixHandle,
+                aStartMs = meta.aStartMs,
+                aDurationMs = d.aDurationMs,
+                bResumeMs = meta.bResumeMs,
+                bDurationMs = meta.bTotalMs,
+                mixLengthMs = meta.mixLengthMs,
+            )
+        // The view first: readers on other threads map the segment's clock as soon as it is current.
+        djView = view
+        promoteDjHandleInternal(d.mixHandle)
+        fadeGains[d.aHandle] = 0f
+        applyVolume(d.aHandle)
+        engine.pause(d.aHandle)
+        Logger.i(TAG, "DJ switch ${d.ready.a}→${d.ready.b}: joined at A ${meta.aStartMs} ms, measured offset $joinError ms")
+
+        val switchAt = meta.mixLengthMs - DJ_OVERLAP_MS
+        while (true) {
+            if (dj !== d) return
+            if (internalState != InternalState.PLAYING || !internalPlayWhenReady) {
+                delay(100)
+                continue
+            }
+            val mixPos = engine.positionMs(d.mixHandle)
+            if (!d.identityPassed && mixPos >= meta.identityMs) {
+                if (!passDjIdentityInternal(d)) return
+            }
+            val remaining = switchAt - mixPos
+            if (remaining > DJ_SYNC_LEAD_MS) {
+                val untilIdentity = if (d.identityPassed) Long.MAX_VALUE else meta.identityMs - mixPos
+                djDelay(minOf(remaining - DJ_SYNC_LEAD_MS, untilIdentity, 500L).coerceAtLeast(20L))
+                continue
+            }
+            if (!d.bIssued && d.bHandle != NO_HANDLE) {
+                engine.playSynced(d.bHandle, d.mixHandle, switchAt)
+                d.bIssued = true
+            }
+            if (remaining > 0) {
+                djDelay(remaining.coerceAtMost(10L))
+                continue
+            }
+            break
+        }
+        finishDjInternal(d, switchAt)
+    }
+
+    /** Linear crossfade between two handles playing the same, aligned audio: the sum stays constant. */
+    private suspend fun djRamp(
+        out: Int,
+        into: Int,
+    ) {
+        val steps = 5
+        for (i in 1..steps) {
+            val t = i.toFloat() / steps
+            setFadeGain(out, 1f - t)
+            setFadeGain(into, t)
+            if (i < steps) delay(DJ_OVERLAP_MS / steps)
+        }
+    }
+
+    /** The track identity moves to B (its melody entry). False when B left the queue (handled here). */
+    private fun passDjIdentityInternal(d: DjSwitch): Boolean {
+        if (d.identityPassed) return true
+        val index = playlist.indexOfFirst { it === d.toItem }
+        if (index < 0) {
+            Logger.w(TAG, "DJ ${d.ready.a}→${d.ready.b}: B left the queue mid-segment, moving on")
+            val playing = internalPlayWhenReady
+            abortDjInternal("B removed")
+            val nextIndex = getNextMediaItemIndex()
+            if (nextIndex != localCurrentMediaItemIndex) {
+                localCurrentMediaItemIndex = nextIndex
+                unpinCurrent()
+                releaseHandle(currentPlayer)
+                currentPlayer = NO_HANDLE
+                loadAndPlayTrackInternal(nextIndex, 0L, playing)
+            }
+            return false
+        }
+        d.identityPassed = true
+        djView?.identityPassed = true
+        localCurrentMediaItemIndex = index
+        unpinCurrent()
+        notifyListeners {
+            onMediaItemTransition(d.toItem, PlayerConstants.MEDIA_ITEM_TRANSITION_REASON_AUTO)
+        }
+        if (d.aHandle != currentPlayer) releaseHandle(d.aHandle)
+        // B plays from its local file now; the stream precached for it is no longer needed.
+        precachedPlayers.remove(d.toItem.mediaId)?.let { cleanupPlayerInternal(it.player) }
+        Logger.i(TAG, "DJ identity ${d.ready.a}→${d.ready.b}: now B at $currentPosition ms")
+        return true
+    }
+
+    /** End of the segment: B (started in step) fades in, then becomes the current handle. */
+    private suspend fun finishDjInternal(
+        d: DjSwitch,
+        switchAt: Long,
+    ) {
+        val b = d.bHandle
+        if (b != NO_HANDLE) {
+            val bStart = djBStartMs(d.ready.meta)
+            var waited = 0L
+            while (!djAligned(d.mixHandle, switchAt, b, bStart) && waited < DJ_START_TIMEOUT_MS) {
+                delay(10)
+                waited += 10
+            }
+            if (dj !== d) return
+            if (djAligned(d.mixHandle, switchAt, b, bStart)) {
+                d.finishing = true
+                djRamp(d.mixHandle, b)
+                if (dj !== d) return
+            } else {
+                // Not in step: B is put where the segment got to instead (a short cut, never a jump).
+                Logger.w(TAG, "DJ ${d.ready.a}→${d.ready.b}: B not in step at the end of the segment, cutting to it")
+            }
+        }
+        commitDjInternal(d, toB = true)
+    }
+
+    /**
+     * Ends a running segment on the track the user is looking at, at its mapped position: B ([toB])
+     * or A. ARMED: nothing audible changes, the switch is just dropped (A stays current).
+     */
+    private fun commitDjInternal(
+        d: DjSwitch,
+        toB: Boolean,
+    ) {
+        if (dj !== d) return
+        if (d.phase == DjPhase.ARMED) {
+            abortDjInternal("committed before the join")
+            return
+        }
+        d.job?.cancel()
+        val meta = d.ready.meta
+        val playing = internalState == InternalState.PLAYING && internalPlayWhenReady
+        val mixPos = engine.positionMs(d.mixHandle)
+        if (toB) {
+            if (!passDjIdentityInternal(d)) return
+            val target = (meta.bResumeMs - (meta.mixLengthMs - mixPos)).coerceAtLeast(0L)
+            val b = d.bHandle
+            if (b == NO_HANDLE) {
+                // B's handle failed: load B the normal way at the same point.
+                abortDjInternal("B handle lost")
+                releaseHandle(currentPlayer)
+                currentPlayer = NO_HANDLE
+                loadAndPlayTrackInternal(localCurrentMediaItemIndex, target, playing)
+                return
+            }
+            if (!d.finishing) {
+                // Not the natural end (Next, seek, error, B out of step): B goes where the segment had got to.
+                engine.pause(b)
+                engine.seek(b, target)
+            }
+            promoteDjHandleInternal(b)
+            if (playing) engine.play(b)
+        } else {
+            val a = d.aHandle
+            engine.seek(a, (meta.aStartMs + mixPos).coerceAtLeast(0L))
+            promoteDjHandleInternal(a)
+            if (playing) engine.play(a)
+        }
+        val kept = currentPlayer
+        dj = null
+        djView = null
+        listOf(d.aHandle, d.mixHandle, d.bHandle).filter { it != NO_HANDLE && it != kept }.distinct().forEach { releaseHandle(it) }
+        Logger.i(
+            TAG,
+            "DJ done ${d.ready.a}→${d.ready.b}: on ${if (toB) "B" else "A"} at ${engine.positionMs(kept)} ms" +
+                if (toB && d.finishing) " (resume point ${meta.bResumeMs} ms)" else " (committed early)",
+        )
+        startPositionUpdates()
+        triggerPrecachingInternal()
+        // B→C may already be ready (it was prepared while the segment played).
+        djRefreshInternal()
+    }
+
+    /** [handle] becomes the current, listened handle at full level. */
+    private fun promoteDjHandleInternal(handle: Int) {
+        currentPlayer = handle
+        setupPlayerEventsInternal(handle)
+        fadeGains.remove(handle)
+        applyPlaybackLevels(handle)
+    }
+
+    /** Drops the switch: every DJ handle except the current one is released, A back at full level. */
+    private fun abortDjInternal(reason: String) {
+        val d = dj ?: return
+        dj = null
+        djView = null
+        d.job?.cancel()
+        listOf(d.aHandle, d.mixHandle, d.bHandle).filter { it != NO_HANDLE && it != currentPlayer }.distinct().forEach { releaseHandle(it) }
+        if (currentPlayer == d.aHandle) {
+            fadeGains.remove(d.aHandle)
+            applyVolume(d.aHandle)
+        }
+        Logger.i(TAG, "DJ off ${d.ready.a}→${d.ready.b} (${d.phase}): $reason")
+    }
+
+    /** Pausing: a synced start already scheduled must not fire into the pause. */
+    private fun djBeforePauseInternal() {
+        val d = dj ?: return
+        when (d.phase) {
+            DjPhase.ARMED ->
+                if (d.mixIssued) {
+                    if (engine.positionMs(d.aHandle) >= d.ready.meta.aStartMs) {
+                        // Inside the join: A carries on (it is the same audio), the switch is dropped.
+                        abortDjInternal("paused at the join")
+                    } else {
+                        engine.pause(d.mixHandle)
+                        engine.seek(d.mixHandle, 0L)
+                        d.mixIssued = false
+                    }
+                }
+            DjPhase.MIXING ->
+                if (d.finishing) {
+                    commitDjInternal(d, toB = true)
+                } else if (d.bIssued) {
+                    engine.pause(d.bHandle)
+                    engine.seek(d.bHandle, djBStartMs(d.ready.meta))
+                    d.bIssued = false
+                }
+        }
+    }
+
+    /** Seeking: ARMED re-arms the segment; MIXING commits to the track shown (A before B's entry, else B). */
+    private fun djBeforeSeekInternal() {
+        val d = dj ?: return
+        when (d.phase) {
+            DjPhase.ARMED -> {
+                if (d.mixIssued) {
+                    engine.pause(d.mixHandle)
+                    engine.seek(d.mixHandle, 0L)
+                    d.mixIssued = false
+                }
+                if (currentPlayer == d.aHandle) {
+                    fadeGains.remove(d.aHandle)
+                    applyVolume(d.aHandle)
+                }
+                fadeGains[d.mixHandle] = 0f
+                applyVolume(d.mixHandle)
+            }
+            DjPhase.MIXING -> commitDjInternal(d, toB = d.identityPassed)
+        }
+    }
+
+    /** Next while the segment still shows A: B is what Next means, and it is already playing. */
+    private fun djCommitForNextInternal(): Boolean {
+        val d = dj ?: return false
+        if (d.phase != DjPhase.MIXING) return false
+        val wasShowingA = !d.identityPassed
+        commitDjInternal(d, toB = true)
+        return wasShowingA
+    }
+
+    /** Commits a running segment to the track shown, before Previous evaluates the position. */
+    private fun djCommitDisplayedInternal() {
+        val d = dj ?: return
+        if (d.phase == DjPhase.MIXING) commitDjInternal(d, toB = d.identityPassed)
+    }
+
+    /** A DJ handle failed: fall back. True when [handle] was one of them and is dealt with. */
+    private fun djHandleFailedInternal(handle: Int): Boolean {
+        val d = dj ?: return false
+        if (handle != d.mixHandle && handle != d.bHandle && handle != d.aHandle) return false
+        if (d.phase == DjPhase.ARMED) {
+            if (handle == d.aHandle) return false // A's own error: the normal path (its reload drops the switch).
+            abortDjInternal("DJ handle $handle failed while armed")
+            return true
+        }
+        when (handle) {
+            d.bHandle -> {
+                Logger.w(TAG, "DJ: B's handle failed, B will be loaded normally")
+                releaseHandle(handle)
+                d.bHandle = NO_HANDLE
+            }
+            d.mixHandle -> {
+                Logger.w(TAG, "DJ: the segment failed mid-way, going to B")
+                commitDjInternal(d, toB = true)
+            }
+            // A is muted and paused by now; it is only kept for a seek back to it.
+            else -> Unit
+        }
+        return true
+    }
+
     // ========== Position Updates ==========
 
     /**
@@ -2102,6 +2698,8 @@ class AvPlayerAdapter(
                             // The engine's own end comes too late for streams it over-measures.
                             checkTrueEndInternal()
                         }
+                        // A transition that became ready while the track was still loading.
+                        if (dj == null && djEnabled() && internalState.isInReadyState()) djRefreshInternal()
                         if (internalState.isInReadyState()) {
                             // Check if should trigger crossfade.
                             // Use currentPlayer's time (not the timeline player) for trigger detection.
@@ -2111,6 +2709,8 @@ class AvPlayerAdapter(
                                 !crossfadeSuppressed &&
                                 internalRepeatMode != PlayerConstants.REPEAT_MODE_ONE &&
                                 !isCrossfading &&
+                                // An armed or running DJ switch owns this transition.
+                                dj == null &&
                                 internalPlayWhenReady &&
                                 !isCurrentTrackVideo() &&
                                 !isNextTrackVideo() &&
@@ -2731,6 +3331,16 @@ class AvPlayerAdapter(
             Logger.w(TAG, "Ignoring onEnded() from stale player")
             return
         }
+        // The DJ segment ran out before the switch to B was made: make it now.
+        dj?.let { d ->
+            if (handle == d.mixHandle) {
+                if (!d.finishing) {
+                    Logger.w(TAG, "DJ segment ended before the switch to B")
+                    commitDjInternal(d, toB = true)
+                }
+                return
+            }
+        }
         // Already ended at its true length (checkTrueEndInternal); this is the over-long one.
         if (handle in trueEndedHandles) {
             Logger.d(TAG, "Ignoring onEnded() after the true end was handled")
@@ -2754,6 +3364,8 @@ class AvPlayerAdapter(
         message: String,
     ) {
         Logger.e(TAG, "Engine playback error: handle=$handle httpStatus=$httpStatus code=$code message=$message")
+
+        if (djHandleFailedInternal(handle)) return
 
         if (handle != NO_HANDLE && handle == secondaryPlayer) {
             Logger.e(TAG, "Secondary player error during crossfade")
@@ -2896,6 +3508,7 @@ class AvPlayerAdapter(
                 repeatMode = internalRepeatMode,
             )
         syncSystemIntegration()
+        syncDjPipeline()
     }
 
     private fun syncSystemIntegration() {
@@ -2925,7 +3538,13 @@ class AvPlayerAdapter(
             }
         } else {
             val live = LiveStreamRegistry.isLive(item.mediaId)
-            val durationMs = if (live || active == NO_HANDLE) 0L else effectiveDurationMs(active).coerceAtLeast(0L)
+            val djTimeline = djView?.takeIf { it.mixHandle == active }
+            val durationMs =
+                when {
+                    live || active == NO_HANDLE -> 0L
+                    djTimeline != null -> djTimeline.durationMs().coerceAtLeast(0L)
+                    else -> effectiveDurationMs(active).coerceAtLeast(0L)
+                }
             if (item !== sentNowPlayingItem ||
                 active != sentNowPlayingHandle ||
                 durationMs != sentNowPlayingDurationMs ||
@@ -2944,6 +3563,13 @@ class AvPlayerAdapter(
                 sentNowPlayingHandle = active
                 sentNowPlayingDurationMs = durationMs
                 sentNowPlayingLive = live
+            }
+            // During a DJ segment the lock screen shows A's / B's clock, not the segment's.
+            if (handleChanged) sentPositionOffset = 0L
+            val offset = djTimeline?.offsetMs() ?: 0L
+            if (offset != sentPositionOffset) {
+                engine.setActivePositionOffset(offset)
+                sentPositionOffset = offset
             }
         }
 
@@ -2964,7 +3590,7 @@ class AvPlayerAdapter(
     init {
         engine.setListener(engineListener)
 
-        // Load crossfade settings. The DJ mode setting is read nowhere on iOS (spec section 3).
+        // Load crossfade settings. DJ mode = pre-rendered transitions (docs/ios-player-bridge.md §7).
         coroutineScope.launch {
             dataStoreManager.watchVideoInsteadOfPlayingAudio.collect { enabled ->
                 watchVideoEnabled = (enabled == DataStoreManager.TRUE)
@@ -2983,6 +3609,20 @@ class AvPlayerAdapter(
             dataStoreManager.crossfadeDuration.collect { duration ->
                 crossfadeDurationMs = duration
                 Logger.d(TAG, "Crossfade duration: $crossfadeDurationMs ms")
+            }
+        }
+
+        coroutineScope.launch {
+            dataStoreManager.crossfadeDjMode.collect { enabled ->
+                djModeEnabled = (enabled == DataStoreManager.TRUE)
+                Logger.d(TAG, "DJ transitions enabled: $djModeEnabled")
+            }
+        }
+
+        djPipeline.onReady = { ready ->
+            coroutineScope.launch {
+                Logger.d(TAG, "DJ transition ready: ${ready.a}→${ready.b}")
+                djRefreshInternal()
             }
         }
 
@@ -3009,6 +3649,27 @@ class AvPlayerAdapter(
 
         /** How close to the true length counts as its end (under one position poll). */
         private const val TRUE_END_TOLERANCE_MS = 150L
+
+        /** DJ: overlap of identical audio at each end of the segment (A→segment, segment→B). */
+        private const val DJ_OVERLAP_MS = 50L
+
+        /** DJ: how long before a join the engine is asked for the synced start (it prerolls first). */
+        private const val DJ_SYNC_LEAD_MS = 1_500L
+
+        /** DJ: a transition that becomes ready later than this before its join is not used. */
+        private const val DJ_ARM_LEAD_MS = 3_000L
+
+        /** DJ: A found this far past the join (a seek, a stall) drops the switch. */
+        private const val DJ_JOIN_LATE_MS = 250L
+
+        /** DJ: how long a synced start may take to show up in the engine's clock. */
+        private const val DJ_START_TIMEOUT_MS = 400L
+
+        /** DJ: largest disagreement between two handles' clocks still taken as "in step". */
+        private const val DJ_ALIGN_TOLERANCE_MS = 80L
+
+        /** DJ: the analysed copy and the stream played may differ by this much in length. */
+        private const val DJ_DURATION_TOLERANCE_MS = 2_500L
 
         /** googlevideo's `dur=` query parameter: the stream's length in seconds. */
         private val DUR_PARAM = Regex("""[?&]dur=([0-9]+(?:\.[0-9]+)?)""")
