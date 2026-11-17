@@ -105,7 +105,10 @@ class SpotifyAuth(
                 throw Exception("Unsuccessful token request")
             }
 
-            if (tokenData.isAnonymous) {
+            if (spDc.isBlank()) {
+                // Asked for on purpose: public playlists can be read without an account.
+                Logger.i("Auth", "Spotify: anonymous token issued")
+            } else if (tokenData.isAnonymous) {
                 // An expired or revoked sp_dc is still answered, with a guest token that lyrics refuse.
                 Logger.e("Auth", "Spotify: sp_dc is no longer valid (anonymous token) — the user must log in to Spotify again")
             } else {

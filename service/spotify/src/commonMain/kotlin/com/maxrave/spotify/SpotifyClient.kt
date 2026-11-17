@@ -25,7 +25,9 @@ import io.ktor.client.request.headers
 import io.ktor.client.request.parameter
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.request
+import io.ktor.http.content.TextContent
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
@@ -46,16 +48,25 @@ class SpotifyClient {
             onlyJson = true,
         )
 
+    // Playlist import pages through thousands of tracks; logging every response body would flood the
+    // log, so this client has no Logging/CurlLogger. Created on first use.
+    private var pathfinderClient: HttpClient? = null
+
     var proxy: ProxyConfig? = null
         set(value) {
             if (field == value) return
             field = value
             spotifyClient.close()
             spotifyClient = createSpotifyClient()
+            pathfinderClient?.close()
+            pathfinderClient = null
         }
 
     @OptIn(ExperimentalSerializationApi::class)
-    private fun createSpotifyClient(onlyJson: Boolean = false) =
+    private fun createSpotifyClient(
+        onlyJson: Boolean = false,
+        quiet: Boolean = false,
+    ) =
         HttpClient(getEngine()) {
             followRedirects = true
             expectSuccess = false
@@ -69,13 +80,15 @@ class SpotifyClient {
                     }
                 }
             }
-            install(HttpCache)
-            install(Logging) {
-                logger = Logger.DEFAULT
-                level = LogLevel.ALL
-            }
-            install(CurlLogger) {
-                logger = { Logger.DEFAULT.log(it) }
+            if (!quiet) {
+                install(HttpCache)
+                install(Logging) {
+                    logger = Logger.DEFAULT
+                    level = LogLevel.ALL
+                }
+                install(CurlLogger) {
+                    logger = { Logger.DEFAULT.log(it) }
+                }
             }
             install(HttpSend) {
                 maxSendCount = 100
@@ -140,10 +153,13 @@ class SpotifyClient {
     suspend fun getSpotifyServerTime(spdc: String) =
         spotifyClient.get("https://open.spotify.com/api/server-time") {
             userAgent(USER_AGENT)
-            header(
-                "Cookie",
-                "sp_dc=$spdc",
-            )
+            // A blank sp_dc asks for an anonymous token (public playlists only).
+            if (spdc.isNotBlank()) {
+                header(
+                    "Cookie",
+                    "sp_dc=$spdc",
+                )
+            }
             header("App-platform", "WebPlayer")
             header("Spotify-App-Version", "1.2.61.20.g3b4cd5b2")
             header("Accept", "application/json")
@@ -161,16 +177,17 @@ class SpotifyClient {
     ) = spotifyClient.get("https://open.spotify.com/api/token") {
         userAgent(USER_AGENT)
         contentType(ContentType.Application.Json)
-        header(
-            "Cookie",
-            "sp_dc=$spdc",
-        )
+        if (spdc.isNotBlank()) {
+            header(
+                "Cookie",
+                "sp_dc=$spdc",
+            )
+        }
         parameter("reason", reason)
         parameter("productType", "mobile-web-player")
         parameter("totp", otpValue)
         parameter("totpServer", otpValue)
         parameter("totpVer", totpVersion)
-        header("Cookie", "sp_dc=$spdc")
         header("Accept", "application/json")
         header("Origin", "https://open.spotify.com")
         header("Referer", "https://open.spotify.com/")
@@ -251,6 +268,31 @@ class SpotifyClient {
                     ),
             ),
         )
+    }
+
+    /**
+     * One persisted GraphQL query against the web player's own API (`api-partner.spotify.com`), the
+     * same POST the web player sends. [body] is the full JSON body (variables, operationName and the
+     * persisted-query hash); see [com.maxrave.spotify.library.SpotifyPathfinder].
+     */
+    suspend fun pathfinderQuery(
+        body: String,
+        authToken: String,
+        clientToken: String,
+    ): HttpResponse {
+        val client = pathfinderClient ?: createSpotifyClient(onlyJson = true, quiet = true).also { pathfinderClient = it }
+        return client.post("https://api-partner.spotify.com/pathfinder/v2/query") {
+            headers {
+                append(HttpHeaders.Authorization, "Bearer $authToken")
+                append("Client-Token", clientToken)
+                append("App-Platform", "WebPlayer")
+                append(HttpHeaders.Accept, "application/json")
+                append(HttpHeaders.UserAgent, USER_AGENT)
+                append(HttpHeaders.Origin, "https://open.spotify.com")
+                append(HttpHeaders.Referrer, "https://open.spotify.com/")
+            }
+            setBody(TextContent(body, ContentType.Application.Json))
+        }
     }
 
     suspend fun getSpotifyClientToken() =

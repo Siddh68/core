@@ -164,11 +164,21 @@ internal class StreamRepositoryImpl(
                         response.streamingData?.adaptiveFormats?.filter { it.url.isNullOrEmpty().not() }
                             ?: emptyList(),
                     )
+                    // AVPlayer plays one URL per item (docs/ios-player-bridge.md §3), so a video it
+                    // plays must carry its own audio: the HLS manifest (pseudo-itag 96, added by
+                    // YouTube.newPipePlayer), else the progressive H.264/AAC 360p MP4. Playback
+                    // only: a download keeps the adaptive choice.
+                    val avPlayerVideo = streamsForAvPlayer && !isDownloading && !muxed
                     val videoFormat =
-                        formatList.find { it.itag == videoItag }
-                            ?: formatList.find { it.itag == ITAG.VIDEO_720P }
-                            ?: formatList.find { it.itag == ITAG.VIDEO_360P }
-                            ?: formatList.find { !it.isAudio && it.url.isNullOrEmpty().not() }
+                        if (avPlayerVideo) {
+                            formatList.find { it.itag == ITAG_HLS_MANIFEST }
+                                ?: formatList.find { it.itag == ITAG.MUXED_360P }
+                        } else {
+                            formatList.find { it.itag == videoItag }
+                                ?: formatList.find { it.itag == ITAG.VIDEO_720P }
+                                ?: formatList.find { it.itag == ITAG.VIDEO_360P }
+                                ?: formatList.find { !it.isAudio && it.url.isNullOrEmpty().not() }
+                        }
                     val audioTwinItag = ITAG.highQualityTwinOf(itag)
                     val audioFormat =
                         if (streamsForAvPlayer) {
@@ -193,7 +203,10 @@ internal class StreamRepositoryImpl(
                     // beats handing it whatever format happens to be last (usually WebM).
                     val hlsManifestUrl = response.streamingData?.hlsManifestUrl
                     val avPlayerHlsFallback = streamsForAvPlayer && !isVideo && !muxed && format == null && hlsManifestUrl != null
-                    if (format == null && !avPlayerHlsFallback) {
+                    // Emitted as is: the manifest URL is path-style, so "&cpn=" cannot be appended.
+                    val avPlayerVideoHls = avPlayerVideo && isVideo && format?.itag == ITAG_HLS_MANIFEST && hlsManifestUrl != null
+                    // No muxed stream is no video for AVPlayer; any other format would play silent.
+                    if (format == null && !avPlayerHlsFallback && !(avPlayerVideo && isVideo)) {
                         format = formatList.lastOrNull { it.url.isNullOrEmpty().not() }
                     }
                     if (muxed) {
@@ -245,7 +258,13 @@ internal class StreamRepositoryImpl(
                     }
                     insertNewFormat(
                         NewFormatEntity(
-                            videoId = if (VIDEO_QUALITY.itags.contains(format?.itag)) "${MERGING_DATA_TYPE.VIDEO}$videoId" else videoId,
+                            // An AVPlayer video row (itag 96/18) must not overwrite the audio row.
+                            videoId =
+                                if (VIDEO_QUALITY.itags.contains(format?.itag) || (avPlayerVideo && isVideo)) {
+                                    "${MERGING_DATA_TYPE.VIDEO}$videoId"
+                                } else {
+                                    videoId
+                                },
                             itag = format?.itag ?: itag,
                             mimeType =
                                 Regex("""([^;]+);\s*codecs=["']([^"']+)["']""")
@@ -294,7 +313,7 @@ internal class StreamRepositoryImpl(
                     )
                     if (data.first != null) {
                         emit(
-                            if (muxed || avPlayerHlsFallback) {
+                            if (muxed || avPlayerHlsFallback || avPlayerVideoHls) {
                                 hlsManifestUrl
                             } else {
                                 format?.url?.let { url ->
@@ -424,6 +443,9 @@ internal class StreamRepositoryImpl(
         }
     }
 }
+/** The HLS manifest's pseudo-itag in the format list (see YouTube.newPipePlayer). */
+private const val ITAG_HLS_MANIFEST = 96
+
 /** 140: AAC at 128 kbps, the stream every account gets. Not a user-facing quality, so not in ITAG. */
 private const val ITAG_AUDIO_AAC_MEDIUM = 140
 

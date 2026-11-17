@@ -12,7 +12,12 @@ import com.maxrave.domain.mediaservice.player.MediaPlayerListener
 import com.maxrave.domain.mediaservice.player.ios.NativePlayerConstants
 import com.maxrave.domain.mediaservice.player.ios.NativePlayerEngine
 import com.maxrave.domain.mediaservice.player.ios.NativePlayerEngineListener
+import com.maxrave.domain.mediaservice.player.ios.NativeVideoOutput
+import com.maxrave.domain.data.player.AudioOutput
+import com.maxrave.domain.extension.isVideo
 import com.maxrave.domain.repository.StreamRepository
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import com.maxrave.logger.Logger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -41,13 +46,6 @@ private const val TAG = "AvPlayerAdapter"
 private const val NO_HANDLE = NativePlayerConstants.NO_HANDLE
 
 /**
- * Phase 2 is audio only: every track resolves to its audio stream and every handle is created with
- * `video = false`, whatever the watch-video setting says. Video arrives in task 3.1, which flips this
- * and brings back the desktop adapter's "skip crossfade around a video" rules that read it.
- */
-private const val PLAY_VIDEO = false
-
-/**
  * iOS implementation of [MediaPlayerInterface], driving the Swift AVPlayer engine through
  * [NativePlayerEngine].
  *
@@ -59,7 +57,10 @@ private const val PLAY_VIDEO = false
  * the mpv code keeps the same object. The contract with Swift is `docs/ios-player-bridge.md`.
  *
  * Left out, because the engine has no equivalent (spec section 4): the DJ / BPM / Camelot / AutoMix
- * machinery, equalizer, effects, 8D, audio outputs, waveform, video frames, pitch and memory trimming.
+ * machinery, equalizer, effects, 8D, waveform, pitch and memory trimming. Video is not frames as on
+ * desktop: a video track plays ONE muxed URL on a handle created with `video = true`, and the
+ * composeApp views attach an `AVPlayerLayer` to the handle published in [NativeVideoOutput]. Audio
+ * outputs list the system route; picking one opens the system AirPlay picker ([AvAudioRoutes]).
  *
  * Threading. The mpv adapter relies on its scope being one service thread. This one does not assume
  * that of the scope it is given: it derives its own serial context ([SerialDispatcher] over
@@ -320,6 +321,21 @@ class AvPlayerAdapter(
 
     @Volatile
     private var released = false
+
+    // ========== Video (task 3.1) ==========
+
+    /** The watch-video setting, as the mpv adapter keeps it for the crossfade skip rules. */
+    @Volatile
+    private var watchVideoEnabled = false
+
+    /** Handles created with `video = true`. Serial context only. */
+    private val videoHandles = HashSet<Int>()
+
+    /** Last value given to [NativeVideoOutput], so it is only re-published on change. */
+    private var sentVideoHandle = Int.MIN_VALUE
+
+    /** The system route as outputs, and the AirPlay picker (spec section 4). */
+    private val audioRoutes = AvAudioRoutes()
 
     // What the engine was last told, so the system state is only re-sent when it changes.
     private var sentActiveHandle = Int.MIN_VALUE
@@ -1185,6 +1201,19 @@ class AvPlayerAdapter(
     /** Stored only; AVPlayer has no silence skipping (spec section 4). */
     override var skipSilenceEnabled: Boolean = false
 
+    // iOS routes audio system-wide: the list shows where the sound goes now, and picking any entry
+    // opens the system AirPlay / Bluetooth picker instead of routing this player alone.
+    override val audioOutputs: StateFlow<List<AudioOutput>>
+        get() = audioRoutes.outputs
+
+    override fun selectAudioOutput(id: String?) {
+        audioRoutes.showRoutePicker()
+    }
+
+    override fun refreshAudioOutputs() {
+        audioRoutes.refresh()
+    }
+
     /**
      * Every handle that can currently reach the audio output.
      *
@@ -1273,6 +1302,9 @@ class AvPlayerAdapter(
             listeners = emptyList()
 
             engine.setActiveHandle(NO_HANDLE)
+            NativeVideoOutput.publish(NO_HANDLE)
+            videoHandles.clear()
+            audioRoutes.release()
             engine.clearNowPlaying()
             // Every handle is released above; this also deactivates the audio session.
             engine.releaseAll()
@@ -1545,10 +1577,12 @@ class AvPlayerAdapter(
         applyPlaybackLevels(player)
     }
 
-    /** Create an engine player for [source]. Phase 2: always audio-only (see [PLAY_VIDEO]). */
+    /** Create an engine player for [source]: a video handle when it is a muxed video stream. */
     private fun createMediaPlayerInternal(source: PlayableSource): Int {
         Logger.d(TAG, if (source.isVideo) "Creating video player" else "Creating audio-only player")
-        return engine.create(source.isVideo)
+        val handle = engine.create(source.isVideo)
+        if (source.isVideo && handle != NO_HANDLE) videoHandles.add(handle)
+        return handle
     }
 
     /**
@@ -1580,6 +1614,7 @@ class AvPlayerAdapter(
         fadeGains.remove(handle)
         trueDurations = trueDurations - handle
         trueEndedHandles.remove(handle)
+        videoHandles.remove(handle)
         engine.release(handle)
     }
 
@@ -1618,13 +1653,12 @@ class AvPlayerAdapter(
 
     /**
      * Crossfade is skipped when the NEXT track will play as a video: a video should start from its
-     * first frame instead of fading in under the outgoing song. Always false until video arrives
-     * (task 3.1, [PLAY_VIDEO]); kept so the gating reads as on desktop.
+     * first frame instead of fading in under the outgoing song. As on desktop.
      */
-    private fun isNextTrackVideo(): Boolean = PLAY_VIDEO
+    private fun isNextTrackVideo(): Boolean = watchVideoEnabled && playlist.getOrNull(getNextMediaItemIndex())?.isVideo() == true
 
-    /** Same skip rule for the CURRENT track. Always false until task 3.1. */
-    private fun isCurrentTrackVideo(): Boolean = PLAY_VIDEO
+    /** Same skip rule for the CURRENT track. */
+    private fun isCurrentTrackVideo(): Boolean = watchVideoEnabled && currentMediaItem?.isVideo() == true
 
     /**
      * A live broadcast never reaches an end to fade out of; the engine reports no duration for it,
@@ -2400,19 +2434,33 @@ class AvPlayerAdapter(
     // ========== URL Extraction ==========
 
     /**
-     * Extract the playable URL for a media item. Phase 2 resolves audio only ([PLAY_VIDEO]); the
-     * engine takes one URL per load (spec section 3, Sources), so there is never anything to merge.
-     * Format filtering (AAC vs Opus) is task 2.5 and not done here.
+     * Extract the playable URL for a media item. The engine takes one URL per load (spec section 3,
+     * Sources), so there is never anything to merge: a video plays from its muxed stream
+     * ([muxedVideoSource]), everything else from its AAC audio stream.
      */
     private suspend fun extractPlayableUrl(mediaItem: GenericMediaItem): PlayableSource? {
         Logger.w(TAG, "Extracting playable URL for ${mediaItem.mediaId}")
         val videoId = mediaItem.mediaId
 
-        // Downloaded files are not checked: downloads on iOS are task 3.5.
+        // A downloaded song plays from its file, no network. Its true length is the one recorded at
+        // download time (0 = unknown, use the engine's): see IosDownloadFiles.
+        com.maxrave.data.download.IosDownloadFiles.localFileUrl(videoId)?.let { fileUrl ->
+            return PlayableSource(isVideo = false, url = fileUrl, trueDurationMs = com.maxrave.data.download.IosDownloadFiles.durationMs(videoId))
+        }
 
         // A live broadcast is one HLS playlist carrying audio and video together, and nothing about
         // it is in the format table (see StreamRepositoryImpl).
-        if (LiveStreamRegistry.isLive(videoId)) return liveStreamSource(videoId, asVideo = PLAY_VIDEO)
+        val shouldFindVideo =
+            mediaItem.isVideo() &&
+                dataStoreManager.watchVideoInsteadOfPlayingAudio.first() == DataStoreManager.TRUE
+        if (LiveStreamRegistry.isLive(videoId)) return liveStreamSource(videoId, asVideo = shouldFindVideo)
+
+        // A video is one muxed stream (spec section 3, Sources). Without one the track still plays,
+        // as audio, through the path below.
+        if (shouldFindVideo) {
+            muxedVideoSource(videoId)?.let { return it }
+            Logger.w(TAG, "No muxed video stream for $videoId, playing its audio")
+        }
 
         // Try new format API
         streamRepository.getNewFormat(videoId).lastOrNull()?.let { format ->
@@ -2455,6 +2503,50 @@ class AvPlayerAdapter(
 
         return null
     }
+
+    /**
+     * A music video as AVPlayer plays it: the HLS manifest or the progressive H.264/AAC MP4 (itag
+     * 18), which StreamRepositoryImpl picks on iOS. The cached format row is tried first; a row
+     * written before that choice existed holds a video-only stream, so its URL is checked before use.
+     */
+    private suspend fun muxedVideoSource(videoId: String): PlayableSource? {
+        streamRepository.getNewFormat(videoId).lastOrNull()?.let { format ->
+            val videoUrl = format.videoUrl
+            if (!videoUrl.isNullOrEmpty() && isMuxedForAvPlayer(videoUrl) &&
+                streamRepository.is403Url(videoUrl).firstOrNull() == false
+            ) {
+                Logger.w("Stream", "Video from format")
+                return PlayableSource(
+                    isVideo = true,
+                    url = videoUrl,
+                    trueDurationMs = trueDurationOf(videoUrl, isLive = false, lengthSeconds = format.lengthSeconds),
+                )
+            }
+        }
+        val videoUrl =
+            streamRepository
+                .getStream(
+                    dataStoreManager,
+                    videoId,
+                    isDownloading = false,
+                    isVideo = true,
+                ).lastOrNull()
+        if (videoUrl.isNullOrEmpty()) return null
+        // getStream is also where a live broadcast is first recognised; its playlist carries the audio.
+        if (LiveStreamRegistry.isLive(videoId)) return PlayableSource(isVideo = true, url = videoUrl, isLive = true)
+        if (!isMuxedForAvPlayer(videoUrl)) return null
+        Logger.d(TAG, "Stream Video for $videoId")
+        val lengthSeconds = streamRepository.getNewFormat(videoId).lastOrNull()?.lengthSeconds
+        return PlayableSource(
+            isVideo = true,
+            url = videoUrl,
+            trueDurationMs = trueDurationOf(videoUrl, isLive = false, lengthSeconds = lengthSeconds),
+        )
+    }
+
+    /** An HLS manifest or the muxed itag 18: a URL AVPlayer plays with sound and picture. */
+    private fun isMuxedForAvPlayer(url: String): Boolean =
+        url.contains(".m3u8") || url.contains("manifest") || ITAG_PARAM.find(url)?.groupValues?.getOrNull(1) == MUXED_ITAG
 
     /** A live broadcast's HLS playlist, resolved afresh on every play — it expires within hours. */
     private suspend fun liveStreamSource(
@@ -2516,7 +2608,8 @@ class AvPlayerAdapter(
                 coroutineScope.launch { onEngineError(handle, httpStatus, code, message) }
             }
 
-            // Phase 3 (video).
+            // Not sent by the engine: the video views read size and first frame off their own
+            // AVPlayerLayer (spec section 5).
             override fun onVideoSize(
                 handle: Int,
                 width: Int,
@@ -2815,6 +2908,13 @@ class AvPlayerAdapter(
             sentActiveHandle = active
         }
 
+        // The video views follow the handle the UI shows, when that handle carries video.
+        val videoHandle = if (active != NO_HANDLE && active in videoHandles) active else NO_HANDLE
+        if (videoHandle != sentVideoHandle) {
+            NativeVideoOutput.publish(videoHandle)
+            sentVideoHandle = videoHandle
+        }
+
         val item = playlist.getOrNull(localCurrentMediaItemIndex)
         if (item == null) {
             if (sentNowPlayingItem != null) {
@@ -2864,8 +2964,14 @@ class AvPlayerAdapter(
     init {
         engine.setListener(engineListener)
 
-        // Load crossfade settings. The DJ mode setting is read nowhere on iOS (spec section 3), and
-        // the watch-video setting is not read until video arrives (task 3.1).
+        // Load crossfade settings. The DJ mode setting is read nowhere on iOS (spec section 3).
+        coroutineScope.launch {
+            dataStoreManager.watchVideoInsteadOfPlayingAudio.collect { enabled ->
+                watchVideoEnabled = (enabled == DataStoreManager.TRUE)
+                Logger.d(TAG, "Watch video enabled: $watchVideoEnabled")
+            }
+        }
+
         coroutineScope.launch {
             dataStoreManager.crossfadeEnabled.collect { enabled ->
                 crossfadeEnabled = (enabled == DataStoreManager.TRUE)
@@ -2906,5 +3012,11 @@ class AvPlayerAdapter(
 
         /** googlevideo's `dur=` query parameter: the stream's length in seconds. */
         private val DUR_PARAM = Regex("""[?&]dur=([0-9]+(?:\.[0-9]+)?)""")
+
+        /** googlevideo's `itag` query parameter. */
+        private val ITAG_PARAM = Regex("""[?&]itag=([0-9]+)""")
+
+        /** H.264 360p + AAC in one progressive MP4 (ITAG.MUXED_360P), as it appears in a URL. */
+        private val MUXED_ITAG = com.maxrave.common.ITAG.MUXED_360P.toString()
     }
 }

@@ -1,9 +1,9 @@
 package org.simpmusic.lyrics.romanization
 
 /**
- * iOS has no Japanese analyzer at all — [PlatformRomanizer]'s ios actual answers null and the
- * line is shown as written — so there is no dictionary to be missing. Reporting ready keeps the
- * settings screen from ever offering a download that could not change anything.
+ * iOS analyzes Japanese with the system's own CFStringTokenizer (see [PlatformRomanizer]'s ios
+ * actual), so there is no dictionary to be missing. Reporting ready keeps the settings screen from
+ * ever offering a download that iOS does not need.
  */
 actual object RomanizationDictionaryPack {
     actual fun configure(directoryPath: String) {

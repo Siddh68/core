@@ -19,6 +19,8 @@ import com.maxrave.data.repository.PlaylistRepositoryImpl
 import com.maxrave.data.repository.PodcastRepositoryImpl
 import com.maxrave.data.repository.SearchRepositoryImpl
 import com.maxrave.data.repository.SongRepositoryImpl
+import com.maxrave.data.repository.SpotifyImportRepositoryImpl
+import com.maxrave.domain.repository.SpotifyImportRepository
 import com.maxrave.data.repository.StreamRepositoryImpl
 import com.maxrave.data.repository.TasteRepositoryImpl
 import com.maxrave.data.repository.UpdateRepositoryImpl
@@ -90,6 +92,11 @@ val repositoryModule =
 
         single<ImportRepository>(createdAtStart = true) {
             ImportRepositoryImpl(get())
+        }
+
+        // Lazy: holds the running Spotify import's state; nothing needs it until the screen opens.
+        single<SpotifyImportRepository> {
+            SpotifyImportRepositoryImpl(get(), get(), get(), get())
         }
 
         single<LocalPlaylistRepository>(createdAtStart = true) {

@@ -86,6 +86,13 @@ interface NativePlayerEngine {
         previous: Boolean,
     )
 
+    /**
+     * The `AVPlayer` behind [handle], for the video views to attach an `AVPlayerLayer` to; null for
+     * an unknown or released handle, or when called off the main thread. Main thread only. Callers
+     * must never change its item, rate or volume: the engine owns the playback.
+     */
+    fun nativePlayer(handle: Int): Any?
+
     /** One listener; a second call replaces the first. Events arrive on the main thread. */
     fun setListener(listener: NativePlayerEngineListener)
 
@@ -169,4 +176,18 @@ object NativePlayerConstants {
 object NativePlayerRegistry {
     @kotlin.concurrent.Volatile
     var engine: NativePlayerEngine? = null
+}
+
+/**
+ * Which engine handle the player video views show: the handle the user is listening to when it was
+ * created with `video = true`, else [NativePlayerConstants.NO_HANDLE] (the views then show the
+ * artwork). Written by `AvPlayerAdapter`, read by the iOS video composables in composeApp.
+ */
+object NativeVideoOutput {
+    private val _handle = kotlinx.coroutines.flow.MutableStateFlow(NativePlayerConstants.NO_HANDLE)
+    val handle: kotlinx.coroutines.flow.StateFlow<Int> = _handle
+
+    fun publish(handle: Int) {
+        _handle.value = handle
+    }
 }
