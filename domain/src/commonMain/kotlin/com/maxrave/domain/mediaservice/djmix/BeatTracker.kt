@@ -30,6 +30,8 @@ object BeatTracker {
     class Result(
         val bpm: Double,
         val beatFrames: IntArray,
+        /** Mean of the onset-strength envelope (dB rises per frame): how punchy the song is. */
+        val onsetMean: Double = 0.0,
     ) {
         val beatSeconds: DoubleArray get() = DoubleArray(beatFrames.size) { beatFrames[it] * HOP.toDouble() / SAMPLE_RATE }
     }
@@ -41,7 +43,7 @@ object BeatTracker {
         val onset = onsetStrength(mono22k)
         if (onset.all { it == 0f }) return Result(0.0, IntArray(0))
         val bpm = tempo(onset)
-        return Result(bpm, beats(onset, bpm, tightness))
+        return Result(bpm, beats(onset, bpm, tightness), onset.sumOf { it.toDouble() } / onset.size)
     }
 
     fun onsetStrength(y: FloatArray): FloatArray {

@@ -1495,6 +1495,19 @@ internal class DataStoreManagerImpl(
         }
     }
 
+    override val djSmartOrder: Flow<String> =
+        settingsDataStore.data.map { preferences ->
+            preferences[DJ_SMART_ORDER] ?: TRUE
+        }
+
+    override suspend fun setDjSmartOrder(enabled: Boolean) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                settings[DJ_SMART_ORDER] = if (enabled) TRUE else FALSE
+            }
+        }
+    }
+
     // Defaults to FALSE: anyone already running crossfade would otherwise find it silently absent
     // on albums after updating.
     override val crossfadeSkipAlbum: Flow<String> =
@@ -1935,6 +1948,7 @@ internal class DataStoreManagerImpl(
         val CROSSFADE_ENABLED = stringPreferencesKey("crossfade_enabled")
         val CROSSFADE_DURATION = intPreferencesKey("crossfade_duration")
         val CROSSFADE_DJ_MODE = stringPreferencesKey("crossfade_dj_mode")
+        val DJ_SMART_ORDER = stringPreferencesKey("dj_smart_order")
         val CROSSFADE_SKIP_ALBUM = stringPreferencesKey("crossfade_skip_album")
         val DJ_INTENSITY = stringPreferencesKey("dj_intensity")
         val DJ_SKIP_TRANSITIONS = stringPreferencesKey("dj_skip_transitions")

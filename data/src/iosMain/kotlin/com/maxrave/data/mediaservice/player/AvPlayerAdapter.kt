@@ -10,6 +10,9 @@ import com.maxrave.domain.data.player.LiveStreamRegistry
 import com.maxrave.domain.data.player.PlayerConstants
 import com.maxrave.domain.data.player.PlayerError
 import com.maxrave.domain.manager.DataStoreManager
+import com.maxrave.domain.mediaservice.djmix.DjMatch
+import com.maxrave.domain.mediaservice.djmix.DjTrackAnalysis
+import com.maxrave.domain.mediaservice.djmix.matchTraits
 import com.maxrave.domain.mediaservice.player.MediaPlayerInterface
 import com.maxrave.domain.mediaservice.player.MediaPlayerListener
 import com.maxrave.domain.mediaservice.player.ios.NativePlayerConstants
@@ -41,6 +44,7 @@ import kotlinx.coroutines.withContext
 import kotlin.concurrent.Volatile
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.random.Random
 
@@ -348,6 +352,27 @@ class AvPlayerAdapter(
 
     /** Pair a "ready too late" was logged for, so it is logged once. */
     private var djLateLogged: String? = null
+
+    // ----- Smart next (see the DJ section) -----
+
+    /** `djSmartOrder`: with DJ transitions on, move the best-mixing upcoming track to play next. */
+    private var djSmartOrderEnabled = true
+
+    /** Look-ahead ids last handed to [djPipeline] with [djSentPair]. */
+    private var djSentLook: List<String> = emptyList()
+
+    /**
+     * Tracks the USER put right after the current one (Play next, a move to that slot). Smart next
+     * never moves anything in front of them, nor looks past them. By identity; serial context only.
+     */
+    private val userPlacedNext = IdentitySet<GenericMediaItem>()
+
+    /** Analyses the pipeline reported, by videoId (null = cannot be analysed). Serial context only. */
+    private val smartAnalyses = LinkedHashMap<String, DjTrackAnalysis?>()
+
+    /** The current track the smart-next decision is about, and whether it has been made. */
+    private var smartFor: GenericMediaItem? = null
+    private var smartDecided = false
 
     private var sentPositionOffset = 0L
 
@@ -815,6 +840,7 @@ class AvPlayerAdapter(
             cancelPrecaching()
 
             playlist.clear()
+            userPlacedNext.clear()
             clearAllPrecacheInternal()
             playlist.add(mediaItem)
             localCurrentMediaItemIndex = 0
@@ -871,6 +897,9 @@ class AvPlayerAdapter(
                 localCurrentMediaItemIndex++
             }
             pointAtFirstItemIfUnset()
+            // Play next (or any insert right after the current track): the user's pick for next.
+            if (currentIndexBeforeInsert >= 0 && index == currentIndexBeforeInsert + 1) userPlacedNext.add(mediaItem)
+            smartQueueEditedByUser()
 
             if (internalShuffleModeEnabled) {
                 if (currentIndexBeforeInsert >= 0 && index == currentIndexBeforeInsert + 1) {
@@ -906,6 +935,8 @@ class AvPlayerAdapter(
             // was removed with shuffle on.
             if (internalShuffleModeEnabled) removeFromShuffleOrder(index)
             pinnedNextItems.remove(track)
+            userPlacedNext.remove(track)
+            smartQueueEditedByUser()
 
             precachedPlayers.remove(track.mediaId)?.let { cached ->
                 cleanupPlayerInternal(cached.player)
@@ -1006,9 +1037,22 @@ class AvPlayerAdapter(
         toIndex: Int,
     ) {
         coroutineScope.launch {
+            val item = moveMediaItemInternal(fromIndex, toIndex) ?: return@launch
+            // A track the user moved right after the current one is their pick for next.
+            if (toIndex == localCurrentMediaItemIndex + 1) userPlacedNext.add(item) else userPlacedNext.remove(item)
+            smartQueueEditedByUser()
+        }
+    }
+
+    /** The playlist move itself (also smart next's), on the serial context. Returns the moved item. */
+    private fun moveMediaItemInternal(
+        fromIndex: Int,
+        toIndex: Int,
+    ): GenericMediaItem? {
+        run {
             // Same reason as removeMediaItem (issue #2156): re-check bounds inside the launch, since the
             // playlist can be emptied by another queued op between an outside-launch guard and removeAt.
-            if (fromIndex !in playlist.indices || toIndex !in playlist.indices) return@launch
+            if (fromIndex !in playlist.indices || toIndex !in playlist.indices) return null
             val item = playlist.removeAt(fromIndex)
             playlist.add(toIndex, item)
 
@@ -1036,6 +1080,7 @@ class AvPlayerAdapter(
 
             clearPrecacheExceptCurrentInternal()
             triggerPrecachingInternal()
+            return item
         }
     }
 
@@ -1044,9 +1089,25 @@ class AvPlayerAdapter(
         toShuffledIndex: Int,
     ) {
         coroutineScope.launch {
+            val moved = moveShuffledItemInternal(fromShuffledIndex, toShuffledIndex) ?: return@launch
+            if (toShuffledIndex == (shuffleIndices.getOrNull(localCurrentMediaItemIndex) ?: -1) + 1) {
+                userPlacedNext.add(moved)
+            } else {
+                userPlacedNext.remove(moved)
+            }
+            smartQueueEditedByUser()
+        }
+    }
+
+    /** The shuffled-order move itself (also smart next's), on the serial context. Returns the moved item. */
+    private fun moveShuffledItemInternal(
+        fromShuffledIndex: Int,
+        toShuffledIndex: Int,
+    ): GenericMediaItem? {
+        run {
             // Same reason as removeMediaItem (issue #2156): checked against the order as it is now.
-            if (!internalShuffleModeEnabled) return@launch
-            if (fromShuffledIndex !in shuffleOrder.indices || toShuffledIndex !in shuffleOrder.indices) return@launch
+            if (!internalShuffleModeEnabled) return null
+            if (fromShuffledIndex !in shuffleOrder.indices || toShuffledIndex !in shuffleOrder.indices) return null
             // Only the play order moves. Playlist indices stay where they were, and with them the
             // current index and the position a running crossfade would revert to.
             shuffleOrder.add(toShuffledIndex, shuffleOrder.removeAt(fromShuffledIndex))
@@ -1066,12 +1127,14 @@ class AvPlayerAdapter(
             // What plays next may have changed.
             clearPrecacheExceptCurrentInternal()
             triggerPrecachingInternal()
+            return playlist.getOrNull(shuffleOrder[toShuffledIndex])
         }
     }
 
     override fun clearMediaItems() {
         coroutineScope.launch {
             playlist.clear()
+            userPlacedNext.clear()
             localCurrentMediaItemIndex = -1
             clearShuffleOrder()
             notifyTimelineChanged("TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED")
@@ -2216,17 +2279,154 @@ class AvPlayerAdapter(
     /** After every serial task: tell the pipeline what to prepare when (current, next) changed. */
     private fun syncDjPipeline() {
         if (released) return
+        val current = playlist.getOrNull(localCurrentMediaItemIndex)
+        if (current !== smartFor) {
+            // A new track: one smart-next decision for it. It is no longer anyone's "next" pick.
+            smartFor = current
+            smartDecided = false
+            current?.let { userPlacedNext.remove(it) }
+        }
         val pair =
             if (djEnabled()) {
-                playlist.getOrNull(localCurrentMediaItemIndex)?.mediaId to djNextItem()?.mediaId
+                current?.mediaId to djNextItem()?.mediaId
             } else {
                 null to null
             }
-        if (pair == djSentPair) return
+        val look =
+            if (pair.second != null && djSmartOrderEnabled && !smartDecided) {
+                smartWindow().drop(1).map { it.mediaId }
+            } else {
+                emptyList()
+            }
+        if (pair == djSentPair && look == djSentLook) return
+        val pairChanged = pair != djSentPair
         djSentPair = pair
-        djPipeline.update(pair.first, pair.second)
+        djSentLook = look
+        djPipeline.update(pair.first, pair.second, look)
+        if (!pairChanged) return
         // Disarms a switch whose next item changed, or arms one already on disk.
         coroutineScope.launch { djRefreshInternal() }
+    }
+
+    // ----- Smart next -----
+    //
+    // With DJ transitions and "Smart order" on, the next SMART_WINDOW upcoming tracks (in play
+    // order: the shuffled order under shuffle, so shuffle still decides what comes up and smart
+    // next only picks among the next few) are analysed by the pipeline after the (current, next)
+    // pair. Once they are all in, or the current track is down to SMART_DECIDE_BY_MS, the one that
+    // mixes best with the current track (DjMatch) is moved to play next through the normal queue
+    // move, when it is clearly better than the queue's own next. One decision per track; a user
+    // edit of the queue asks for it again. Nothing is moved in front of, or looked for past, a
+    // track the user put next themselves.
+
+    /** The candidates in play order, [0] = the queue's own next (the DJ target). Serial context. */
+    private fun smartWindow(): List<GenericMediaItem> {
+        val current = playlist.getOrNull(localCurrentMediaItemIndex) ?: return emptyList()
+        val next = djNextItem() ?: return emptyList()
+        val upcoming: List<Int> =
+            if (internalShuffleModeEnabled) {
+                if (!shuffleOrderCovers(playlist.size)) return emptyList()
+                val pos = shuffleIndices.getOrNull(localCurrentMediaItemIndex) ?: return emptyList()
+                (pos + 1 until minOf(shuffleOrder.size, pos + 1 + SMART_SCAN_LIMIT)).map { shuffleOrder[it] }
+            } else {
+                (localCurrentMediaItemIndex + 1 until minOf(playlist.size, localCurrentMediaItemIndex + 1 + SMART_SCAN_LIMIT)).toList()
+            }
+        val out = ArrayList<GenericMediaItem>(SMART_WINDOW)
+        val ids = HashSet<String>()
+        for (index in upcoming) {
+            if (out.size >= SMART_WINDOW) break
+            val item = playlist.getOrNull(index) ?: break
+            if (out.isEmpty()) {
+                // Must be the track Next plays (not a wrap under Repeat All).
+                if (item !== next) return emptyList()
+                out.add(item)
+                ids.add(item.mediaId)
+                if (item in userPlacedNext) break
+                continue
+            }
+            if (item in userPlacedNext) break
+            val skip =
+                item.mediaId == current.mediaId ||
+                    item.mediaId in ids ||
+                    (watchVideoEnabled && item.isVideo()) ||
+                    LiveStreamRegistry.isLive(item.mediaId)
+            if (skip) continue
+            out.add(item)
+            ids.add(item.mediaId)
+        }
+        return out
+    }
+
+    /** The queue changed by the user's hand: decide again (their own "next" stays where it is). */
+    private fun smartQueueEditedByUser() {
+        smartDecided = false
+    }
+
+    private fun smartOnAnalysed(
+        id: String,
+        analysis: DjTrackAnalysis?,
+    ) {
+        smartAnalyses.remove(id)
+        smartAnalyses[id] = analysis
+        while (smartAnalyses.size > SMART_MEMORY) smartAnalyses.remove(smartAnalyses.keys.first())
+        smartMaybeDecideInternal()
+    }
+
+    /** Makes the decision for the current track once its candidates are in (or time is short). */
+    private fun smartMaybeDecideInternal() {
+        if (smartDecided || !djSmartOrderEnabled || !djEnabled()) return
+        val current = playlist.getOrNull(localCurrentMediaItemIndex) ?: return
+        if (current !== smartFor || dj?.phase == DjPhase.MIXING || isCrossfading) return
+        val window = smartWindow()
+        if (window.size < 2) return
+        if (!smartAnalyses.containsKey(current.mediaId)) return
+        val currentAnalysis = smartAnalyses[current.mediaId]
+        val handle = currentPlayer
+        val dur = if (handle != NO_HANDLE) effectiveDurationMs(handle) else 0L
+        val left = if (dur > 0) dur - effectivePositionMs(handle) else Long.MAX_VALUE
+        val allIn = window.all { smartAnalyses.containsKey(it.mediaId) }
+        if (!allIn && left > SMART_DECIDE_BY_MS) return
+        smartDecided = true
+        if (currentAnalysis == null) return
+        val next = window[0]
+        fun bpm(a: DjTrackAnalysis?) = a?.let { ((it.bpm * 10).roundToInt() / 10.0).toString() } ?: "?"
+        val head = "DJ next: current=${current.mediaId} (${bpm(currentAnalysis)},${currentAnalysis.keyName})"
+        if (next in userPlacedNext) {
+            Logger.i(TAG, "$head kept=${next.mediaId} (placed next by the user)")
+            return
+        }
+        if (left < SMART_GIVE_UP_MS) {
+            Logger.i(TAG, "$head kept=${next.mediaId} (only ${left / 1000} s left)")
+            return
+        }
+        val analyses = window.map { smartAnalyses[it.mediaId] }
+        val choice = DjMatch.choose(currentAnalysis.matchTraits(), analyses.map { it?.matchTraits() })
+        fun fmt(x: Double?) = x?.let { ((it * 100).roundToInt() / 100.0).toString() } ?: "-"
+        val list =
+            window.indices.joinToString(" ") { i ->
+                val a = analyses[i]
+                val sc = choice.scores[i]
+                "${window[i].mediaId}:${bpm(a)}/${a?.keyName ?: "?"}/${fmt(sc?.total)}" + if (sc?.matched == true) "m" else ""
+            }
+        val nextScore = fmt(choice.scores[0]?.total)
+        if (!choice.moved) {
+            Logger.i(TAG, "$head kept=${next.mediaId} score $nextScore; candidates: $list")
+            return
+        }
+        val pick = window[choice.index]
+        val from = playlist.indexOfFirst { it === pick }
+        val moved =
+            if (internalShuffleModeEnabled) {
+                val to = (shuffleIndices.getOrNull(localCurrentMediaItemIndex) ?: -1) + 1
+                moveShuffledItemInternal(shuffleIndices.getOrNull(from) ?: -1, to)
+            } else {
+                moveMediaItemInternal(from, localCurrentMediaItemIndex + 1)
+            }
+        Logger.i(
+            TAG,
+            "$head ${if (moved === pick) "moved" else "move failed"}=${pick.mediaId} from pos ${choice.index + 1} " +
+                "score ${fmt(choice.scores[choice.index]?.total)} vs $nextScore; candidates: $list",
+        )
     }
 
     /** Arms the ready transition for (current, next), or drops an armed one that no longer fits. */
@@ -2700,6 +2900,8 @@ class AvPlayerAdapter(
                         }
                         // A transition that became ready while the track was still loading.
                         if (dj == null && djEnabled() && internalState.isInReadyState()) djRefreshInternal()
+                        // Smart next: decide with what is analysed once the track nears its end.
+                        if (!smartDecided && internalState.isInReadyState()) smartMaybeDecideInternal()
                         if (internalState.isInReadyState()) {
                             // Check if should trigger crossfade.
                             // Use currentPlayer's time (not the timeline player) for trigger detection.
@@ -3619,6 +3821,17 @@ class AvPlayerAdapter(
             }
         }
 
+        coroutineScope.launch {
+            dataStoreManager.djSmartOrder.collect { enabled ->
+                djSmartOrderEnabled = (enabled == DataStoreManager.TRUE)
+                Logger.d(TAG, "DJ smart order enabled: $djSmartOrderEnabled")
+            }
+        }
+
+        djPipeline.onAnalysed = { _, id, analysis ->
+            coroutineScope.launch { smartOnAnalysed(id, analysis) }
+        }
+
         djPipeline.onReady = { ready ->
             coroutineScope.launch {
                 Logger.d(TAG, "DJ transition ready: ${ready.a}→${ready.b}")
@@ -3667,6 +3880,21 @@ class AvPlayerAdapter(
 
         /** DJ: largest disagreement between two handles' clocks still taken as "in step". */
         private const val DJ_ALIGN_TOLERANCE_MS = 80L
+
+        /** Smart next: how many upcoming tracks (the queue's own next included) are compared. */
+        private const val SMART_WINDOW = 6
+
+        /** Smart next: how far into the play order to look for [SMART_WINDOW] usable tracks. */
+        private const val SMART_SCAN_LIMIT = 20
+
+        /** Smart next: with this little of the current track left, decide with what is analysed. */
+        private const val SMART_DECIDE_BY_MS = 45_000L
+
+        /** Smart next: past this, a move would leave no time to render the new transition. */
+        private const val SMART_GIVE_UP_MS = 30_000L
+
+        /** Smart next: analyses kept in memory. */
+        private const val SMART_MEMORY = 64
 
         /** DJ: the analysed copy and the stream played may differ by this much in length. */
         private const val DJ_DURATION_TOLERANCE_MS = 2_500L

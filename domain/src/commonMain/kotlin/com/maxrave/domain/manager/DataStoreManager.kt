@@ -460,6 +460,14 @@ interface DataStoreManager {
     suspend fun setCrossfadeDjMode(enabled: Boolean)
 
     /**
+     * iOS DJ transitions: pick, from the next few queue tracks, the one that mixes best with the
+     * current song and move it to play next. On by default (it only acts with DJ transitions on).
+     */
+    val djSmartOrder: Flow<String>
+
+    suspend fun setDjSmartOrder(enabled: Boolean)
+
+    /**
      * When on, transitions *between tracks of the same album* skip the crossfade, so an album that
      * was sequenced to run continuously keeps doing so. Edges still crossfade: the last album track
      * into whatever follows it fades normally. Off by default — it changes how crossfade behaves

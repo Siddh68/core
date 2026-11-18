@@ -29,13 +29,21 @@ data class DjTrackAnalysis(
     val firstSoundSec: Double,
     /** Start of the first sustained full-strength stretch (djmix5's B entry target), or null. */
     val fullStrengthSec: Double? = null,
+    /**
+     * Share of the spectral energy in the percussive part (median-filter HPSS over a few excerpts
+     * of the song's body), 0..1: drums-led vs. sustained/vocal-led. Null before [VERSION] 2.
+     */
+    val percussiveRatio: Double? = null,
+    /** Mean onset strength over the whole song (BeatTracker's envelope): how punchy it is. */
+    val onsetMean: Double? = null,
 ) {
     val keyName: String get() = KeyDetector.NOTES[keyTonic] + if (keyMinor) "m" else ""
 
     fun encode(): String = json.encodeToString(serializer(), this)
 
     companion object {
-        const val VERSION = 1
+        /** 2: adds [percussiveRatio] and [onsetMean] (smart next-track order). */
+        const val VERSION = 2
         private val json =
             Json {
                 encodeDefaults = true
@@ -102,6 +110,8 @@ class DjTrackAnalyzer {
         val gain = DjDsp.loudnessGain(e)
         val db = DjDsp.levelsDb(e, gain)
         val sr = DjDsp.SAMPLE_RATE.toDouble()
+        val firstSound = DjDsp.firstSound(db) / sr
+        val musicEnd = DjDsp.musicEnd(db, total.toInt()) / sr
         return DjTrackAnalysis(
             totalFrames = total,
             bpm = beat.bpm,
@@ -110,9 +120,11 @@ class DjTrackAnalyzer {
             keyMinor = key.minor,
             keyConfidence = key.confidence,
             loudnessGain = gain,
-            musicEndSec = DjDsp.musicEnd(db, total.toInt()) / sr,
-            firstSoundSec = DjDsp.firstSound(db) / sr,
+            musicEndSec = musicEnd,
+            firstSoundSec = firstSound,
             fullStrengthSec = DjDsp.fullStrength(db)?.let { it / sr },
+            percussiveRatio = DjMatch.percussiveRatio(mono, firstSound, musicEnd),
+            onsetMean = beat.onsetMean,
         )
     }
 

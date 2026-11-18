@@ -28,6 +28,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.lastOrNull
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import okio.FileSystem
@@ -47,7 +48,7 @@ import kotlin.time.TimeSource
 private const val TAG = "DjMix"
 
 /** Bumped when the render, its options or the file layout change: older renders are redone. */
-private const val MIX_VERSION = 1
+private const val MIX_VERSION = 2
 
 /** Sidecar of a rendered transition (`<a>__<b>.mix.json`). */
 @Serializable
@@ -119,12 +120,31 @@ internal class DjMixPipeline(
     private val dataStoreManager: DataStoreManager,
     private val streamRepository: StreamRepository,
 ) {
-    private val control = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(1))
+    private val controlDispatcher = Dispatchers.Default.limitedParallelism(1)
+    private val control = CoroutineScope(SupervisorJob() + controlDispatcher)
     private val work = DjUtilityDispatcher.limitedParallelism(1)
 
     private var wantedA: String? = null
     private var wantedB: String? = null
     private var job: Job? = null
+
+    /**
+     * Smart next: the further upcoming tracks to analyse after (A, B), in queue order. Read by the
+     * running job between songs, so a change here alone never cancels work in flight.
+     */
+    @Volatile
+    private var wantedLook: List<String> = emptyList()
+
+    /** Ids whose analysis (or failure) was already reported for the current A. Control context only. */
+    private val reported = HashSet<String>()
+    private var reportedFor: String? = null
+
+    /**
+     * Smart next: the analysis of [id] (null = it cannot be analysed) made for current track [forA].
+     * Called on the pipeline's thread; A, B and each look-ahead id are reported once per A.
+     */
+    @Volatile
+    var onAnalysed: ((forA: String, id: String, analysis: DjTrackAnalysis?) -> Unit)? = null
 
     /** Pairs that cannot be rendered (plan or decode refused them): not retried this run. */
     private val failedPairs = HashSet<String>()
@@ -154,13 +174,29 @@ internal class DjMixPipeline(
     fun update(
         a: String?,
         b: String?,
+        lookAhead: List<String> = emptyList(),
     ) {
         control.launch {
-            if (a == wantedA && b == wantedB) return@launch
+            val look = lookAhead.filter { it != a && it != b }.distinct()
+            if (a == wantedA && b == wantedB) {
+                if (look == wantedLook) return@launch
+                wantedLook = look
+                // A running job picks the new list up itself; a finished one is restarted for the
+                // ids it has not reported yet (everything before them is on disk by now).
+                if (a != null && job?.isActive != true && look.any { it !in reported }) {
+                    job = control.launch(work) { runPair(a, b) }
+                }
+                return@launch
+            }
             wantedA = a
             wantedB = b
+            wantedLook = look
             job?.cancel()
             job = null
+            if (a != reportedFor) {
+                reportedFor = a
+                reported.clear()
+            }
             if (a == null) return@launch
             job =
                 control.launch(work) {
@@ -170,6 +206,21 @@ internal class DjMixPipeline(
                 }
         }
     }
+
+    /** Reports [id]'s analysis for [a] once. Runs on [work]; [reported] is touched on [control]. */
+    private suspend fun report(
+        a: String,
+        id: String,
+        analysis: DjTrackAnalysis?,
+    ) {
+        val first = withContext(controlDispatcher) { reportedFor == a && reported.add(id) }
+        if (first) onAnalysed?.invoke(a, id, analysis)
+    }
+
+    private suspend fun isReported(
+        a: String,
+        id: String,
+    ): Boolean = withContext(controlDispatcher) { reportedFor == a && id in reported }
 
     fun release() {
         control.cancel()
@@ -181,21 +232,53 @@ internal class DjMixPipeline(
     ) {
         try {
             DjCache.ensureDirectory()
-            val protectedIds = setOfNotNull(a, b)
+            transition(a, b)
+            // Smart next: the further upcoming tracks, one at a time, after the pair itself so
+            // the transition about to be needed is never delayed by them.
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val id = wantedLook.firstOrNull { it != a && it != b && !isReported(a, it) } ?: break
+                val analysis =
+                    try {
+                        ensureAnalysis(id)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        Logger.w(TAG, "DJ look-ahead $id failed: ${e.message}")
+                        null
+                    }
+                report(a, id, analysis)
+            }
+            DjCache.evict(setOfNotNull(a, b) + wantedLook)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Logger.w(TAG, "DJ pipeline ${a}→$b failed: ${e.message}")
+        }
+    }
+
+    /** Stage 1-3 for (A, B): the songs analysed (and reported) and the transition rendered. */
+    private suspend fun transition(
+        a: String,
+        b: String?,
+    ) {
+        try {
             if (b != null) {
                 existingTransition(a, b)?.let {
                     publish(it)
+                    // Cached JSON reads: cheap, and the smart-next pick needs both.
+                    if (!isReported(a, a)) report(a, a, ensureAnalysis(a))
+                    if (!isReported(a, b)) report(a, b, ensureAnalysis(b))
                     return
                 }
             }
-            val ia = ensureAnalysis(a) ?: return
-            if (b == null) {
-                DjCache.evict(protectedIds)
-                return
-            }
+            val ia = ensureAnalysis(a)
+            report(a, a, ia)
+            if (ia == null || b == null) return
             val key = "$a>$b"
-            if (key in failedPairs) return
-            val ib = ensureAnalysis(b) ?: return
+            val ib = ensureAnalysis(b)
+            report(a, b, ib)
+            if (ib == null || key in failedPairs) return
             val ready = render(a, b, ia, ib)
             releaseMemory()
             if (ready == null) {
@@ -203,7 +286,7 @@ internal class DjMixPipeline(
                 return
             }
             publish(ready)
-            DjCache.evict(protectedIds)
+            DjCache.evict(setOfNotNull(a, b) + wantedLook)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
@@ -446,10 +529,7 @@ internal class DjMixPipeline(
         }
         val mixPath = DjCache.mixPath(a, b)
         writeWav(mixPath, rendered.pcm)
-        val melodyBeat = if (rendered.plan.matched) 24.0 else 3.0
-        val identity =
-            rendered.blendStart +
-                (rendered.blendLength * (melodyBeat / rendered.plan.blendBeats).coerceIn(0.0, 1.0)).toInt()
+        val identity = rendered.identityFrame
         val meta =
             DjTransitionMeta(
                 a = a,

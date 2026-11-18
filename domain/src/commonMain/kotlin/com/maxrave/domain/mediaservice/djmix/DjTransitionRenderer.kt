@@ -30,8 +30,10 @@ data class DjTransitionOptions(
      * that allows it) instead of 8 beats + the blend before A's music end.
      */
     val skipAtSec: Double? = null,
-    /** Blend length in beats at the common tempo; default 32 when the tempos match, else 12. */
+    /** Blend length in beats at the common tempo for matched tempos (default 32). */
     val blendBeats: Int? = null,
+    /** Length of the breakdown blend (djmix6) used when the tempos cannot be matched. */
+    val unmatchedSecs: Double = 20.0,
     /** Largest tempo bend per song (djmix3.MAX_BEND). */
     val maxBend: Double = 0.085,
     /** Let A move up to one semitone toward a key compatible with B's. */
@@ -62,6 +64,8 @@ data class DjTransitionPlan(
     val aExit: Int,
     /** B sample of B's first played beat. */
     val bStart: Int,
+    /** Where in the blend the track identity moves to B (B's melody is in), in samples. */
+    val identityInBlend: Int,
     /** Song ranges [from, to) the renderer reads. */
     val aWindowFrom: Int,
     val aWindowTo: Int,
@@ -77,6 +81,8 @@ class RenderedTransition(
     /** Where the blend (both songs audible) starts in [pcm], and how long it lasts. */
     val blendStart: Int,
     val blendLength: Int,
+    /** Frame of [pcm] where the track identity moves to B. */
+    val identityFrame: Int,
     val plan: DjTransitionPlan,
     val aGain: Double,
     val bGain: Double,
@@ -94,7 +100,8 @@ class RenderedTransition(
  * - both blend windows split into harmonic/percussive (median-filter HPSS) and three bands;
  *   B's drums rise over beats 0-16, the bass swaps at 16-17, A's drums leave over 17-24, A's
  *   melody goes into a 3/4-beat echo (send 19-21, cut 24-25) while its dry signal fades 21-25,
- *   B's melody comes in 22-26 (12 beats with echo-out when the tempos are too far apart);
+ *   B's melody comes in 22-26;
+ * - tempos too far apart (no bend possible): djmix6's breakdown blend instead, see [blendUnmatched];
  * - the level rides a line from A's level before to B's after.
  */
 object DjTransitionRenderer {
@@ -102,6 +109,12 @@ object DjTransitionRenderer {
     private const val HPSS_FFT = 4096
     private const val HPSS_HOP = 1024
     private const val SPLICE = 1024
+
+    /** Unmatched: untouched A in the segment before the blend starts. */
+    private const val UNMATCHED_LEAD_SEC = 2.0
+
+    /** Unmatched: identity switch to B, in seconds of a 20 s blend (scaled with it). */
+    private const val UNMATCHED_IDENTITY_SEC = 8.0
 
     fun plan(
         a: DjTrackAnalysis,
@@ -121,9 +134,10 @@ object DjTransitionRenderer {
         }
         val semis = if (matched && options.keyShift) KeyDetector.keyShift(a.keyTonic, a.keyMinor, b.keyTonic, b.keyMinor) else 0
         val beat = 60 / common
-        val blendBeats = options.blendBeats ?: if (matched) 32 else 12
-        val blend = blendBeats * beat
-        val glideA = 8 * 60 / ta
+        val blend = if (matched) (options.blendBeats ?: 32) * beat else options.unmatchedSecs
+        val blendBeats = if (matched) options.blendBeats ?: 32 else (blend / beat).roundToInt()
+        // Untouched A before the blend: A's 8-beat tempo glide, or a short lead-in when unmatched.
+        val glideA = if (matched) 8 * 60 / ta else UNMATCHED_LEAD_SEC
 
         val beatsA = a.beats
         var exitT: Double
@@ -141,17 +155,27 @@ object DjTransitionRenderer {
 
         val beatsB = b.beats
         val fs = b.firstSoundSec
-        var b0 = beatsB.firstOrNull { it >= fs } ?: fs
         val full = b.fullStrengthSec
-        if (matched && full != null && beatsB.isNotEmpty()) {
-            val want = full - 26 * beat * rb
-            beatsB.lastOrNull { it >= b0 && it <= max(b0, want) }?.let { b0 = it }
+        var b0: Double
+        if (matched) {
+            b0 = beatsB.firstOrNull { it >= fs } ?: fs
+            if (full != null && beatsB.isNotEmpty()) {
+                val want = full - 26 * beat * rb
+                beatsB.lastOrNull { it >= b0 && it <= max(b0, want) }?.let { b0 = it }
+            }
+        } else {
+            // djmix6: the end of B's intro plays under A, so B reaches full strength as the blend ends.
+            val want = max(fs, (full ?: 0.0) - blend * 0.85)
+            b0 = beatsB.firstOrNull { it >= want - 0.3 } ?: want
         }
         val aStart = (bendStart * SR).roundToInt()
         val aExit = (exitT * SR).toInt()
         val bStart = (b0 * SR).toInt()
         val n = (blend * SR).toInt()
-        val bNeedSec = (blend + 2 * beat) * rb + 8 * 60 / tb + 7.0
+        val bNeedSec = if (matched) (blend + 2 * beat) * rb + 8 * 60 / tb + 7.0 else blend + 7.0
+        // Matched: B's melody is in by beat 24 of 32. Unmatched: at 8 s (of 20) B's melody is near
+        // full, just before A's starts washing out.
+        val identity = if (matched) n * 24 / blendBeats else (UNMATCHED_IDENTITY_SEC * blend / 20.0 * SR).toInt()
         return DjTransitionPlan(
             matched = matched,
             tempoA = ta,
@@ -167,6 +191,7 @@ object DjTransitionRenderer {
             aOverStart = overStart * SR,
             aExit = aExit,
             bStart = bStart,
+            identityInBlend = identity.coerceIn(0, n),
             aWindowFrom = max(0, aStart - 5 * SR),
             aWindowTo = min(a.totalFrames.toInt(), aExit + SR),
             bWindowFrom = bStart,
@@ -257,7 +282,8 @@ object DjTransitionRenderer {
                 anchor = pos
             }
         }
-        val lead = anchor.toInt() - overW
+        // Unmatched: the tempos never line up, so B simply starts with the blend.
+        val lead = if (plan.matched) anchor.toInt() - overW else 0
 
         // --- B: from its first beat at the common tempo, gliding back to its own after the blend.
         val lb = (plan.bStart - plan.bWindowFrom).toDouble()
@@ -314,7 +340,7 @@ object DjTransitionRenderer {
                 FloatArray(n) { bAt(0, it - lead) },
                 FloatArray(n) { bAt(1, it - lead) },
             )
-        val mix = blend(aBlend, bBlend, plan)
+        val mix = if (plan.matched) blend(aBlend, bBlend, plan) else blendUnmatched(aBlend, bBlend, plan, options.unmatchedSecs)
 
         // Ride the level from A's 4 s before the blend to B's 4 s after it.
         var energyA = 0.0
@@ -381,7 +407,7 @@ object DjTransitionRenderer {
             if (plan.matched) {
                 "both meet at ${fmt(plan.commonTempo)} bpm (A x${fmt(plan.rateA, 3)}, B x${fmt(plan.rateB, 3)})"
             } else {
-                "tempo gap too big, no bend"
+                "tempo gap too big, breakdown blend"
             }
         val summary =
             "A ${fmt(plan.tempoA)} bpm ${aAnalysis.keyName} -> B ${fmt(bAnalysis.bpm)} bpm ${bAnalysis.keyName}; $how; " +
@@ -393,6 +419,7 @@ object DjTransitionRenderer {
             bResumeFrame = bResume,
             blendStart = overW,
             blendLength = n,
+            identityFrame = overW + plan.identityInBlend,
             plan = plan,
             aGain = gA,
             bGain = gB,
@@ -416,31 +443,14 @@ object DjTransitionRenderer {
             sine: Boolean = true,
         ) = DjDsp.ramp(m, beatS, b0, b1, sine)
 
-        val bDrums: FloatArray
-        val bassB: FloatArray
-        val aDry: FloatArray
-        val aSend: FloatArray
-        val aDrums: FloatArray
-        val bMel: FloatArray
-        if (plan.matched) {
-            bDrums = ramp(0.0, 16.0)
-            bassB = ramp(16.0, 17.0)
-            aDry = cosOf(ramp(21.0, 25.0, false))
-            val up = ramp(19.0, 21.0, false)
-            val cut = ramp(24.0, 25.0, false)
-            aSend = FloatArray(m) { up[it] * (1 - cut[it]) }
-            aDrums = cosOf(ramp(17.0, 24.0, false))
-            bMel = ramp(22.0, 26.0)
-        } else {
-            bDrums = ramp(2.0, 6.0)
-            bassB = ramp(3.0, 6.0)
-            aDry = cosOf(ramp(0.0, 4.0, false))
-            val up = ramp(0.0, 1.0, false)
-            val cut = ramp(4.0, 5.0, false)
-            aSend = FloatArray(m) { up[it] * (1 - cut[it]) }
-            aDrums = aDry
-            bMel = ramp(1.0, 5.0)
-        }
+        val bDrums = ramp(0.0, 16.0)
+        val bassB = ramp(16.0, 17.0)
+        val aDry = cosOf(ramp(21.0, 25.0, false))
+        val up = ramp(19.0, 21.0, false)
+        val cut = ramp(24.0, 25.0, false)
+        val aSend = FloatArray(m) { up[it] * (1 - cut[it]) }
+        val aDrums = cosOf(ramp(17.0, 24.0, false))
+        val bMel = ramp(22.0, 26.0)
         val bassA = FloatArray(m) { sqrt(max(0f, 1 - bassB[it] * bassB[it])) }
         val gALow = FloatArray(m) { bassA[it] * aDrums[it] }
         val gBLowDrums = FloatArray(m) { bassB[it] * max(bDrums[it], bMel[it]) }
@@ -476,6 +486,73 @@ object DjTransitionRenderer {
             stft.inverseInto(specB, m, out, band = wl, perc = maskB, harmonic = false, gain = gBLowDrums)
             stft.inverseInto(specB, m, out, band = wl, perc = maskB, harmonic = true, gain = gBLowMel)
             stft.inverseInto(specB, m, out, band = upper, perc = maskB, harmonic = true, gain = bMel)
+        }
+        return StereoPcm(outL, outR)
+    }
+
+    /**
+     * djmix6's breakdown blend for tempos too far apart to beat-match (times in seconds of a 20 s
+     * blend, scaled by S = [secs] / 20; ramps are smoothstep-then-sine, "out" is cos of that):
+     * A's drums out 0-4, A's bass out 5-10, B's melody/intro in 1.5-12, A's melody out 9-17 into a
+     * 3/4-beat echo (send in 8-10, off 16-17; feedback 0.55, 10 repeats, darkened: half the low,
+     * 0.9 of the mids, no highs), B's bass in 9-13 (times B's melody gain), B's drums in 13-17.5
+     * (their low band also times B's bass). Only one song's drums ever play.
+     */
+    private fun blendUnmatched(
+        a: StereoPcm,
+        b: StereoPcm,
+        plan: DjTransitionPlan,
+        secs: Double,
+    ): StereoPcm {
+        val m = a.frames
+        val sc = secs / 20.0
+
+        // In seconds (one "beat" of DjDsp.ramp = one second here).
+        fun ramp(
+            t0: Double,
+            t1: Double,
+        ) = DjDsp.ramp(m, SR, t0 * sc, t1 * sc, true)
+
+        val aDrums = cosOf(ramp(0.0, 4.0))
+        val aBass = cosOf(ramp(5.0, 10.0))
+        val bMel = ramp(1.5, 12.0)
+        val aMel = cosOf(ramp(9.0, 17.0))
+        val sendUp = ramp(8.0, 10.0)
+        val sendOff = ramp(16.0, 17.0)
+        val aSend = FloatArray(m) { sendUp[it] * (1 - sendOff[it]) }
+        val bBass = ramp(9.0, 13.0)
+        val bDrums = ramp(13.0, 17.5)
+        val gBLowMel = FloatArray(m) { bBass[it] * max(bMel[it], 0f) }
+        val gBLowDrums = FloatArray(m) { bDrums[it] * bBass[it] }
+
+        val stft = Stft(HPSS_FFT, HPSS_HOP)
+        val (wl, wh) = DjDsp.bandMasks(HPSS_FFT, SR)
+        val bins = stft.bins
+        val upper = FloatArray(bins) { 1 - wl[it] } // mid + high
+        val dark = FloatArray(bins) { 0.5f * wl[it] + 0.9f * (1 - wl[it] - wh[it]) } // half low + 0.9 mid
+        val delay = (0.75 * 60 / plan.tempoA * SR).toInt()
+
+        val outL = FloatArray(m)
+        val outR = FloatArray(m)
+        for (ch in 0..1) {
+            val out = if (ch == 0) outL else outR
+            // A
+            val specA = stft.forward(a.channel(ch))
+            val maskA = Hpss.percussiveMask(specA)
+            stft.inverseInto(specA, m, out, perc = maskA, harmonic = false, gain = aDrums)
+            stft.inverseInto(specA, m, out, band = wl, perc = maskA, harmonic = true, gain = aBass)
+            stft.inverseInto(specA, m, out, band = upper, perc = maskA, harmonic = true, gain = aMel)
+            val send = stft.synthesize(specA, m, band = upper, perc = maskA, harmonic = true)
+            for (i in 0 until m) send[i] *= aSend[i]
+            val tail = DjDsp.echo(send, delay, 0.55, 10)
+            stft.inverseInto(stft.forward(tail), m, out, band = dark)
+            // B
+            val specB = stft.forward(b.channel(ch))
+            val maskB = Hpss.percussiveMask(specB)
+            stft.inverseInto(specB, m, out, band = upper, perc = maskB, harmonic = true, gain = bMel)
+            stft.inverseInto(specB, m, out, band = wl, perc = maskB, harmonic = true, gain = gBLowMel)
+            stft.inverseInto(specB, m, out, band = upper, perc = maskB, harmonic = false, gain = bDrums)
+            stft.inverseInto(specB, m, out, band = wl, perc = maskB, harmonic = false, gain = gBLowDrums)
         }
         return StereoPcm(outL, outR)
     }

@@ -188,6 +188,82 @@ class DjMixVerification {
         }
     }
 
+    /**
+     * djmix6 (breakdown blend for unmatched tempos) listening test: runs when DJMIX_SCRATCH and
+     * DJMIX_UNMATCHED_OUT are set. Renders the three approved pairs with djmix6's framing (15 s of
+     * A before the blend, the blend, 15 s of B after it), loudness-matched like the prototype.
+     */
+    @Test
+    fun renderUnmatchedPairs() {
+        val scratch = System.getenv("DJMIX_SCRATCH")?.let(::File) ?: return
+        val out = System.getenv("DJMIX_UNMATCHED_OUT")?.let(::File) ?: return
+        out.mkdirs()
+        val cache = File(scratch, "mixcache")
+        val analysisDir = File(scratch, "djmix_kt").apply { mkdirs() }
+        fun analysis(vid: String): DjTrackAnalysis {
+            val f = File(analysisDir, "$vid.json")
+            return DjTrackAnalysis.decode(if (f.exists()) f.readText() else "")
+                ?: DjTrackAnalyzer.analyze(load(File(cache, "$vid.f32"))).also { f.writeText(it.encode()) }
+        }
+        val report = StringBuilder()
+        val pairs =
+            listOf(
+                Triple("1 Zaalima into Darkhaast", "eXkHvT--DBU", "-3vUz7QPljM"),
+                Triple("2 Bandhu 2.0 into Zaalima", "eQoI2bPIkDY", "eXkHvT--DBU"),
+                Triple("3 Khairiyat into Jaana Samjho Na", "q3HNo5a3ol4", "5G4CQS9h8WA"),
+            )
+        for ((name, va, vb) in pairs) {
+            val a = load(File(cache, "$va.f32"))
+            val b = load(File(cache, "$vb.f32"))
+            val ia = analysis(va)
+            val ib = analysis(vb)
+            val opts = DjTransitionOptions(levelMode = DjLevelMode.NORMALIZED, limiter = false)
+            val plan = DjTransitionRenderer.plan(ia, ib, opts)
+            val t0 = System.nanoTime()
+            val r = DjTransitionRenderer.render(plan, a.slice(plan.aWindowFrom, plan.aWindowTo), b.slice(plan.bWindowFrom, plan.bWindowTo), ia, ib, opts)
+            val ms = (System.nanoTime() - t0) / 1_000_000
+            val blendInA = r.aStartFrame + r.blendStart
+            val preFrom = max(0, blendInA - 15 * sr)
+            val postLen = 15 * sr
+            val total = (r.aStartFrame - preFrom) + r.pcm.frames + postLen
+            val l = FloatArray(total)
+            val rr = FloatArray(total)
+            var k = 0
+            val ga = r.aGain.toFloat()
+            val gb = r.bGain.toFloat()
+            for (i in preFrom until r.aStartFrame) {
+                l[k] = a.left[i] * ga
+                rr[k++] = a.right[i] * ga
+            }
+            for (i in 0 until r.pcm.frames) {
+                l[k] = r.pcm.left[i]
+                rr[k++] = r.pcm.right[i]
+            }
+            for (i in 0 until postLen) {
+                val j = r.bResumeFrame + i
+                l[k] = if (j < b.frames) b.left[j] * gb else 0f
+                rr[k++] = if (j < b.frames) b.right[j] * gb else 0f
+            }
+            val clip = StereoPcm(l, rr)
+            val peak = DjDsp.peak(clip)
+            if (peak > 0.98f) {
+                val g = 0.98f / peak
+                for (i in 0 until total) {
+                    l[i] *= g
+                    rr[i] *= g
+                }
+            }
+            writeWav(File(out, "$name.wav"), clip)
+            val line =
+                "$name: ${r.summary}; render $ms ms; matched ${plan.matched}; A blend from " +
+                    "${"%.2f".format(blendInA / sr.toDouble())} s, B from ${"%.2f".format(plan.bStart / sr.toDouble())} s, " +
+                    "B resumes ${"%.2f".format(r.bResumeFrame / sr.toDouble())} s; identity at +${"%.1f".format((r.identityFrame - r.blendStart) / sr.toDouble())} s of the blend"
+            println(line)
+            report.appendLine(line)
+        }
+        File(out, "report.txt").writeText(report.toString())
+    }
+
     private fun step(
         x: FloatArray,
         at: Int,
